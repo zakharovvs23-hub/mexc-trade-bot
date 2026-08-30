@@ -39,10 +39,15 @@ def format_scan_result(results: list[dict], errors: list[tuple]) -> str:
     lines = ["📊 Результаты сканирования (от сильных к слабым):", ""]
     for i, d in enumerate(results, start=1):
         emoji = "🟢" if d["signal_type"] == "BUY" else "⚪️"
+        review_mark = " 🔎" if d.get("needs_review") else ""
         lines.append(
-            f"{i}. {emoji} {d['coin']} — {d['signal_type']} "
+            f"{i}. {emoji} {d['coin']} — {d['signal_type']}{review_mark} "
             f"| цена {d['price']} | RSI {d['daily_rsi']} | score {d['score']:.1f}"
         )
+
+    if any(d.get("needs_review") for d in results):
+        lines.append("")
+        lines.append("🔎 — сигнал на боковике, нужна доп. проверка на дневном таймфрейме")
 
     if errors:
         lines.append("")
