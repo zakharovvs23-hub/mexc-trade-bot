@@ -1,58 +1,79 @@
 """
 Бэктест торговой стратегии по историческим дневным данным (~1 год).
-Правило совпадает с signals.py: покупка при недельном MACD-тренде вверх
-и дневном RSI ниже порога; выход по Take-Profit, Stop-Loss или по лимиту
-времени удержания.
-Недельный тренд для истории приближённо считается ресемплингом дневных
+Правило теперь совпадает с живой логикой signals.py (Elder's Triple Screen):
+покупка при недельном Screen 1 = Бычий (MACD-гистограмма растёт, MA10>MA30>MA60,
+MA60 растёт >1% за 6 недель) И дневном Screen 2 = Bear Power отрицательный,
+но разворачивается вверх при Bull Power > 0. RSI в правило входа не входит —
+он вторичное подтверждение, как и в живом сканере.
+Выход по Take-Profit, Stop-Loss или по лимиту времени удержания.
+Недельная структура для истории приближённо считается ресемплингом дневных
 закрытий в 7-дневные свечи (MEXC отдаёт недельные свечи только текущим
 окном, а не произвольным диапазоном в прошлом).
 """
 import pandas as pd
 from mexc_api import get_klines
 
-
-def _rsi_series(closes: pd.Series, period: int = 14) -> pd.Series:
-    delta = closes.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / period, min_periods=period).mean()
-    avg_loss = loss.ewm(alpha=1 / period, min_periods=period).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+FLAT_MA_THRESHOLD_PCT = 1.0
+ELDER_PERIOD = 13
 
 
-def _weekly_trend_series(daily_close: pd.Series) -> pd.Series:
+def _weekly_tier_a_series(daily_close: pd.Series) -> pd.Series:
+    """Screen 1 по каждому дню истории: True, если на тот момент недельная
+    структура была Бычий (Tier A) — та же логика, что в signals.calc_weekly_ma_trend,
+    но векторизованная и с недельным MACD-гистограммой в довесок."""
     weekly = daily_close.resample("7D").last().dropna()
-    if len(weekly) < 35:
-        raise ValueError("Недостаточно исторических данных для недельного MACD")
+    if len(weekly) < 66:
+        raise ValueError("Недостаточно исторических данных для недельного Screen 1 (нужно ~66 недель)")
+
     ema_fast = weekly.ewm(span=12, adjust=False).mean()
     ema_slow = weekly.ewm(span=26, adjust=False).mean()
     macd_line = ema_fast - ema_slow
     signal_line = macd_line.ewm(span=9, adjust=False).mean()
-    trend_up = (macd_line - signal_line) > 0
-    return trend_up.reindex(daily_close.index, method="ffill")
+    hist = macd_line - signal_line
+    hist_rising = hist > hist.shift(1)
+
+    ma10 = weekly.rolling(10).mean()
+    ma30 = weekly.rolling(30).mean()
+    ma60 = weekly.rolling(60).mean()
+    ma60_slope_pct = (ma60 - ma60.shift(6)) / ma60.shift(6) * 100
+    bull_order = (weekly > ma10) & (ma10 > ma30) & (ma30 > ma60)
+
+    tier_a = hist_rising & bull_order & (ma60_slope_pct > FLAT_MA_THRESHOLD_PCT)
+    return tier_a.reindex(daily_close.index, method="ffill").fillna(False)
 
 
-def backtest(coin: str, days: int = 365, rsi_threshold: float = 50,
-             tp_pct: float = 0.06, sl_pct: float = 0.03, max_hold_days: int = 30) -> dict:
+def _daily_screen2_series(df: pd.DataFrame, period: int = ELDER_PERIOD) -> pd.Series:
+    """Screen 2 по каждому дню: True, если Bear Power отрицательный, но растёт
+    (разворот отката), при Bull Power положительном — та же логика, что в
+    indicators.calc_elder_ray, но на всю историю сразу."""
+    ema = df["close"].ewm(span=period, adjust=False).mean()
+    bull_power = df["high"] - ema
+    bear_power = df["low"] - ema
+    bear_rising = bear_power > bear_power.shift(1)
+    return (bear_power < 0) & bear_rising & (bull_power > 0)
+
+
+def backtest(coin: str, days: int = 365, tp_pct: float = 0.06, sl_pct: float = 0.03,
+             max_hold_days: int = 30) -> dict:
     """
-    Прогоняет правило BUY (недельный тренд вверх + дневной RSI < rsi_threshold)
-    по историческим данным и считает гипотетическую доходность.
+    Прогоняет правило BUY (Screen 1 Бычий И Screen 2 сработал) по историческим
+    данным и считает гипотетическую доходность.
     """
-    klines = get_klines(coin, "1d", limit=min(days + 60, 1000))
+    klines = get_klines(coin, "1d", limit=min(days + 90, 1000))
     df = pd.DataFrame(klines)
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
     df = df.set_index("open_time")
 
     closes = df["close"]
-    rsi_series = _rsi_series(closes)
-    weekly_up = _weekly_trend_series(closes)
+    tier_a = _weekly_tier_a_series(closes)
+    screen2 = _daily_screen2_series(df)
+    entry_signal = tier_a & screen2
 
     trades = []
     i = 0
     n = len(df)
     while i < n - 1:
-        if bool(weekly_up.iloc[i]) and rsi_series.iloc[i] < rsi_threshold:
+        if bool(entry_signal.iloc[i]):
             entry_price = float(closes.iloc[i])
             tp_price = entry_price * (1 + tp_pct)
             sl_price = entry_price * (1 - sl_pct)
@@ -109,12 +130,12 @@ def backtest(coin: str, days: int = 365, rsi_threshold: float = 50,
 def format_backtest(result: dict) -> str:
     if result["trades"] == 0:
         return (
-            f"📈 Бэктест {result['coin']}: за выбранный период сигналов на покупку не было.\n"
+            f"📈 Бэктест {result['coin']}: за выбранный период сигналов Screen 1+2 не было.\n"
             "Попробуй другую монету или измени параметры (tp=/sl=)."
         )
 
     lines = [
-        f"📈 Бэктест {result['coin']} (TP {result['tp_pct']*100:.0f}%, SL {result['sl_pct']*100:.0f}%)",
+        f"📈 Бэктест {result['coin']} — Elder's Triple Screen (TP {result['tp_pct']*100:.0f}%, SL {result['sl_pct']*100:.0f}%)",
         "",
         f"Сделок: {result['trades']}",
         f"Win-rate: {result['win_rate']}%",
