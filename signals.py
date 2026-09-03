@@ -1,20 +1,22 @@
 import pandas as pd
-from indicators import calc_rsi, calc_macd, calc_volume_signal
+from indicators import calc_rsi, calc_macd, calc_volume_signal, calc_elder_ray
 from mexc_api import get_klines, get_current_price
 from fear_greed import get_fear_greed, fear_greed_note
 
-FLAT_MA_THRESHOLD_PCT = 1.0  # изменение MA60 за 5 недель, ниже которого тренд считается плоским
+FLAT_MA_THRESHOLD_PCT = 1.0  # изменение MA60 за 6 недель, ниже которого тренд считается плоским
 
 
 def calc_weekly_ma_trend(weekly_close: pd.Series, price: float) -> dict:
     """
-    Классифицирует недельный тренд по MA10/MA30/MA60 на три категории:
-    Бычий — цена выше всех трёх MA, и MA60 подтверждённо растёт.
-    Медвежий — цена ниже MA60, и MA60 подтверждённо падает (MA выступает сопротивлением).
-    Боковик — всё остальное: MA плоские, цена колеблется без выраженного наклона,
-    смешанное расположение относительно MA (в т.ч. ранние признаки смены тренда).
+    Screen 1 (недельный, Elder's Triple Screen) — классифицирует тренд по MA10/MA30/MA60.
+
+    Бычий ("Tier A") — цена выше MA10 выше MA30 выше MA60 (правильный порядок,
+    а не просто "цена выше каждой по отдельности"), и MA60 подтверждённо растёт
+    (>1% за 6 недель).
+    Медвежий — цена ниже MA60, и MA60 подтверждённо падает.
+    Боковик — всё остальное (MA плоские, смешанный порядок, ранние признаки смены тренда).
     """
-    if len(weekly_close) < 65:
+    if len(weekly_close) < 66:
         return {"trend": "Недостаточно данных", "ma10": None, "ma30": None, "ma60": None, "ma60_slope_pct": None}
 
     ma10 = weekly_close.rolling(10).mean()
@@ -24,10 +26,12 @@ def calc_weekly_ma_trend(weekly_close: pd.Series, price: float) -> dict:
     ma10_now = ma10.iloc[-1]
     ma30_now = ma30.iloc[-1]
     ma60_now = ma60.iloc[-1]
-    ma60_prev = ma60.iloc[-6]  # 5 недель назад
+    ma60_prev = ma60.iloc[-7]  # 6 недель назад
     ma60_slope_pct = (ma60_now - ma60_prev) / ma60_prev * 100
 
-    if price > ma10_now and price > ma30_now and price > ma60_now and ma60_slope_pct > FLAT_MA_THRESHOLD_PCT:
+    bull_order = price > ma10_now > ma30_now > ma60_now
+
+    if bull_order and ma60_slope_pct > FLAT_MA_THRESHOLD_PCT:
         trend = "Бычий"
     elif price < ma60_now and ma60_slope_pct < -FLAT_MA_THRESHOLD_PCT:
         trend = "Медвежий"
@@ -86,10 +90,17 @@ def find_support_resistance(df_d: pd.DataFrame, price: float, window: int = 3) -
 
 def analyze_raw(coin: str) -> dict:
     """
-    Считает все индикаторы и итоговый сигнал по монете,
+    Считает Elder's Triple Screen целиком и итоговый сигнал по монете,
     возвращает словарь с данными (без форматирования текста).
     Используется и для одиночного анализа (analyze), и для
-    массового сканирования (scanner.py).
+    массового сканирования пулом (scanner.py).
+
+    Три состояния сигнала (не два):
+    - BUY   — Screen 1 (недельный) Бычий И Screen 2 (дневной Bear Power) сработал сейчас.
+    - WATCH — Screen 1 Бычий, но Screen 2 ещё не сработал (структура готова,
+              ждём разворота отката). Раньше такие монеты просто терялись в WAIT
+              и сигнал по ним можно было пропустить, хотя тренд уже был бычий.
+    - WAIT  — Screen 1 не Бычий (Медвежий или Боковик), на споте не рассматриваем.
     """
     price = get_current_price(coin)
 
@@ -105,58 +116,70 @@ def analyze_raw(coin: str) -> dict:
     volume_note = calc_volume_signal(df_d["volume"])
     volume_ratio_pct = calc_volume_ratio(df_d)
     sr_levels = find_support_resistance(df_d, price)
+    elder = calc_elder_ray(df_d)
 
     fg_value, fg_class = get_fear_greed()
     fg_note = fear_greed_note(fg_value, fg_class)
 
-    weekly_trend_text = "вверх" if weekly_macd["trend_up"] else "вниз"
     ma_trend = calc_weekly_ma_trend(df_w["close"], price)
+    weekly_trend_text = "вверх" if weekly_macd["trend_up"] else "вниз"
 
-    # --- Правило 18: сначала недельный тренд (Triple Screen, первый экран) ---
-    # --- Логика сигнала (спот, только покупки) ---
-    signal_type = None
+    # --- Screen 1: недельный тренд, Tier A = MACD-гистограмма растёт И MA-структура Бычий ---
+    tier_a = weekly_macd["rising"] and ma_trend["trend"] == "Бычий"
+
     reasoning = []
     needs_review = False
 
-    if weekly_macd["trend_up"]:
-        if daily_rsi < 50:
+    if tier_a:
+        if elder["screen2_trigger"]:
             signal_type = "BUY"
-            reasoning.append("Недельный тренд вверх, дневной откат (RSI < 50) — подходящая точка")
+            reasoning.append(
+                "Screen 1: недельный тренд Бычий (MACD-гистограмма растёт, MA10>MA30>MA60). "
+                "Screen 2: Bear Power отрицательный, но разворачивается вверх при Bull Power > 0 — точка входа."
+            )
         else:
-            signal_type = "WAIT"
-            reasoning.append("Недельный тренд вверх, но дневной RSI высокий — ждём отката")
+            signal_type = "WATCH"
+            reasoning.append(
+                "Screen 1: недельный тренд Бычий — структура готова к покупке. "
+                "Screen 2 ещё не сработал: ждём разворота Bear Power (сейчас "
+                f"{elder['bear_power']}, {'растёт' if elder['bear_power_rising'] else 'падает'})."
+            )
+    elif ma_trend["trend"] == "Медвежий" or not weekly_macd["trend_up"]:
+        signal_type = "WAIT"
+        reasoning.append("Недельный тренд не бычий — на споте покупки не рассматриваем (правило 18)")
     else:
         signal_type = "WAIT"
-        reasoning.append("Недельный тренд вниз — на споте покупки не рассматриваем (правило 18)")
-
-    # --- Фильтр по недельному MA-тренду ---
-    if signal_type == "BUY" and ma_trend["trend"] == "Медвежий":
-        signal_type = "WAIT"
-        reasoning.append("Тренд против сигнала: недельный MA-тренд медвежий (MA60 выступает сопротивлением)")
-    elif signal_type == "BUY" and ma_trend["trend"] == "Боковик":
         needs_review = True
-        reasoning.append("Недельный тренд — боковик: сигнал требует доп. проверки на дневном таймфрейме")
+        reasoning.append("Недельный тренд — боковик/переходный: сигнала нет, требует ручной проверки")
+
+    # RSI — вторичное подтверждение (дивергенция), не первичный триггер (правило 13).
+    # Не меняет сигнал, только идёт в текст и в счёт.
+    if signal_type in ("BUY", "WATCH") and daily_rsi > 70:
+        reasoning.append(f"⚠️ RSI {daily_rsi} — перекуплен, возможна дивергенция, проверь дневной график глазами")
 
     # Фон Fear & Greed как модификатор (правило 17), не меняет тип сигнала, только предупреждение
     fg_warning = ""
     if fg_value is not None and fg_value >= 75 and signal_type == "BUY":
         fg_warning = "\n⚠️ Рынок в экстремальной жадности — сигнал слабее обычного, возьми меньше объём"
-    elif fg_value is not None and fg_value <= 25 and signal_type == "WAIT":
+    elif fg_value is not None and fg_value <= 25 and signal_type in ("BUY", "WATCH"):
         fg_warning = "\n👀 Рынок в экстремальном страхе — присмотрись, но жди подтверждения тренда"
 
-    # --- Score для ранжирования при массовом сканировании ---
+    # --- Score для ранжирования при массовом сканировании пулом (сильные сверху) ---
+    # BUY всегда выше WATCH, WATCH всегда выше WAIT.
     if signal_type == "BUY":
-        score = 100 - daily_rsi
-        if daily_macd["trend_up"]:
+        score = 200 - daily_rsi
+        if weekly_macd["rising"]:
             score += 10
         if fg_value is not None and fg_value >= 75:
             score -= 15
-        if needs_review:
-            score -= 5
+    elif signal_type == "WATCH":
+        score = 100 - daily_rsi
     else:
         score = daily_rsi - 100
         if not weekly_macd["trend_up"]:
             score -= 20
+        if needs_review:
+            score -= 5
 
     return {
         "coin": coin.upper(),
@@ -167,11 +190,13 @@ def analyze_raw(coin: str) -> dict:
         "volume_note": volume_note,
         "volume_ratio_pct": volume_ratio_pct,
         "sr_levels": sr_levels,
+        "elder": elder,
         "fg_value": fg_value,
         "fg_note": fg_note,
         "fg_warning": fg_warning,
         "weekly_trend_text": weekly_trend_text,
         "ma_trend": ma_trend,
+        "tier_a": tier_a,
         "signal_type": signal_type,
         "needs_review": needs_review,
         "reasoning": reasoning,
@@ -180,16 +205,22 @@ def analyze_raw(coin: str) -> dict:
 
 
 def analyze(coin: str) -> str:
-    """Форматированный текстовый анализ по одной монете (как раньше)."""
+    """Форматированный текстовый анализ по одной монете — вся та же информация,
+    которую видит Вадим при ручной проверке: Screen 1, Screen 2, RSI, объём, S/R, фон."""
     d = analyze_raw(coin)
 
     lines = []
     lines.append(f"📊 {d['coin']} — анализ")
     lines.append(f"Текущая цена: {d['price']}")
     lines.append("")
-    lines.append(f"Недельный тренд (MACD): {d['weekly_trend_text']}")
-    lines.append(f"Недельный тренд (MA): {d['ma_trend']['trend']}")
-    lines.append(f"Дневной: RSI {d['daily_rsi']}, MACD-гистограмма {d['daily_macd']['slope']}")
+    lines.append(f"Screen 1 (недельный MACD): {d['weekly_trend_text']} ({d['weekly_macd']['slope']})")
+    lines.append(f"Screen 1 (недельный MA-тренд): {d['ma_trend']['trend']}"
+                  + (f", MA60 наклон {d['ma_trend']['ma60_slope_pct']}% за 6 нед." if d['ma_trend']['ma60_slope_pct'] is not None else ""))
+    e = d["elder"]
+    if e["bull_power"] is not None:
+        lines.append(f"Screen 2 (Elder-ray): Bull Power {e['bull_power']}, Bear Power {e['bear_power']}"
+                      f" ({'растёт' if e['bear_power_rising'] else 'падает'})")
+    lines.append(f"Дневной RSI (вторично): {d['daily_rsi']}")
     if d["volume_ratio_pct"] is not None:
         lines.append(f"Объём: {d['volume_note']} ({d['volume_ratio_pct']}% от среднего)")
     else:
@@ -208,16 +239,18 @@ def analyze(coin: str) -> str:
         entry = round(d["price"], 6)
         sl = round(entry * 0.97, 6)
         tp = round(entry * 1.06, 6)
-        lines.append("💡 СИГНАЛ: Buy" + (" ⚠️ требует доп. проверки" if d["needs_review"] else ""))
+        lines.append("💡 СИГНАЛ: Buy")
         lines.append(f"Вход: {entry}")
         lines.append(f"Stop-Loss: {sl} (-3.0%)")
         lines.append(f"Take-Profit: {tp} (+6.0%)")
         lines.append("R/R: 1:2")
-        lines.append("")
-        lines.append("Обоснование: " + "; ".join(d["reasoning"]))
+    elif d["signal_type"] == "WATCH":
+        lines.append("💡 СИГНАЛ: Следить (структура бычья, входа ещё нет)")
     else:
         lines.append("💡 СИГНАЛ: Ждать")
-        lines.append("Обоснование: " + "; ".join(d["reasoning"]))
+
+    lines.append("")
+    lines.append("Обоснование: " + "; ".join(d["reasoning"]))
 
     if d["fg_warning"]:
         lines.append(d["fg_warning"])
