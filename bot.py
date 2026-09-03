@@ -4,7 +4,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 from signals import analyze
-from scanner import scan_coins, format_scan_result, TOP_COINS
+from scanner import scan_coins, format_scan_result, TOP_COINS, POOLS
 from backtest import backtest, format_backtest
 
 logging.basicConfig(level=logging.INFO)
@@ -12,21 +12,53 @@ logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
+TELEGRAM_MSG_LIMIT = 3500  # с запасом от жёсткого лимита Telegram в 4096 символов
+
 WELCOME = (
     "Привет, Вадим! Я твой торговый аналитик по MEXC.\n\n"
     "Просто напиши мне тикер монеты, например:\n"
     "ADA\n"
     "SOL\n"
     "BTC\n\n"
-    "Я подтяну графики с MEXC (неделя + день), посчитаю RSI, MACD, объём, "
-    "гляну индекс страха/жадности и выдам тебе анализ с готовым сигналом.\n\n"
-    "Другие команды:\n"
-    "/scan — просканировать топ-10 монет и отсортировать по силе сигнала\n"
+    "Я подтяну графики с MEXC (неделя + день), прогоню полный Elder's Triple Screen "
+    "(недельный тренд + дневной Bull/Bear Power), гляну RSI, объём, индекс страха/жадности "
+    "и выдам сигнал: BUY (точка входа готова), WATCH (тренд бычий, входа ещё нет) или WAIT.\n\n"
+    "Команды:\n"
+    "/scan — просканировать топ-10 монет пулом и отсортировать по силе сигнала\n"
     "/scan 20 — просканировать топ-20\n"
-    "/scan BTC ETH SOL — просканировать свой список монет (до 50 штук)\n"
+    "/scan BTC ETH SOL — просканировать свой список монет пулом (до 50 штук за раз)\n"
+    "/pool a (b, c, d, e) — просканировать пулом весь фиксированный пул ротации, "
+    "без необходимости присылать список тикеров вручную\n"
+    "/pool all — просканировать все пулы A-E подряд (199 тикеров, займёт время)\n"
     "/backtest BTC — прогнать стратегию по BTC за ~год\n"
-    "/backtest BTC tp=0.08 sl=0.04 — то же со своими Take-Profit/Stop-Loss"
+    "/backtest BTC tp=0.08 sl=0.04 — то же со своими Take-Profit/Stop-Loss\n\n"
+    "Ордера я не выставляю и в MEXC не захожу — только анализ. Решение и покупку делаешь ты сам."
 )
+
+
+def _chunk_text(text: str, limit: int = TELEGRAM_MSG_LIMIT) -> list[str]:
+    """Режет длинный текст на части по границам строк, не разрывая строку пополам,
+    чтобы не упереться в лимит Telegram (4096 символов на сообщение)."""
+    lines = text.split("\n")
+    chunks = []
+    current = []
+    current_len = 0
+    for line in lines:
+        line_len = len(line) + 1
+        if current_len + line_len > limit and current:
+            chunks.append("\n".join(current))
+            current = []
+            current_len = 0
+        current.append(line)
+        current_len += line_len
+    if current:
+        chunks.append("\n".join(current))
+    return chunks or [text]
+
+
+async def _reply_chunked(update: Update, text: str):
+    for chunk in _chunk_text(text):
+        await update.message.reply_text(chunk)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -61,10 +93,51 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         coins = TOP_COINS[:10]
 
     await update.message.chat.send_action("typing")
-    await update.message.reply_text(f"Сканирую {len(coins)} монет, подожди немного...")
+    await update.message.reply_text(f"Сканирую {len(coins)} монет пулом, подожди немного...")
     try:
         results, errors = scan_coins(coins)
-        await update.message.reply_text(format_scan_result(results, errors))
+        await _reply_chunked(update, format_scan_result(results, errors))
+    except Exception as e:
+        logger.exception("Ошибка сканирования")
+        await update.message.reply_text(f"Ошибка при сканировании: {e}")
+
+
+async def pool_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Использование: /pool a (или b, c, d, e, all)\n"
+            f"Доступные пулы: {', '.join(k.upper() for k in POOLS)} "
+            f"({sum(len(v) for v in POOLS.values())} тикеров всего)"
+        )
+        return
+
+    key = args[0].strip().lower()
+
+    if key == "all":
+        for pool_key, coins in POOLS.items():
+            await update.message.chat.send_action("typing")
+            await update.message.reply_text(f"Сканирую пул {pool_key.upper()} ({len(coins)} монет)...")
+            try:
+                results, errors = scan_coins(coins)
+                await _reply_chunked(update, format_scan_result(results, errors, title=f"Пул {pool_key.upper()}"))
+            except Exception as e:
+                logger.exception("Ошибка сканирования пула %s", pool_key)
+                await update.message.reply_text(f"Ошибка при сканировании пула {pool_key.upper()}: {e}")
+        return
+
+    if key not in POOLS:
+        await update.message.reply_text(
+            f"Не знаю пул '{key}'. Доступные: {', '.join(k.upper() for k in POOLS)}, или 'all'."
+        )
+        return
+
+    coins = POOLS[key]
+    await update.message.chat.send_action("typing")
+    await update.message.reply_text(f"Сканирую пул {key.upper()} ({len(coins)} монет)...")
+    try:
+        results, errors = scan_coins(coins)
+        await _reply_chunked(update, format_scan_result(results, errors, title=f"Пул {key.upper()}"))
     except Exception as e:
         logger.exception("Ошибка сканирования")
         await update.message.reply_text(f"Ошибка при сканировании: {e}")
@@ -104,6 +177,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("scan", scan))
+    app.add_handler(CommandHandler("pool", pool_cmd))
     app.add_handler(CommandHandler("backtest", backtest_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_coin))
 
