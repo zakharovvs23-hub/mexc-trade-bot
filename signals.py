@@ -1,15 +1,17 @@
 import pandas as pd
-from indicators import calc_rsi, calc_macd, calc_volume_signal, calc_elder_ray
+
+from indicators import calc_rsi, calc_macd, calc_volume_signal, calc_elder_ray, calc_breakout_signal
 from mexc_api import get_klines, get_current_price
 from fear_greed import get_fear_greed, fear_greed_note
 
 FLAT_MA_THRESHOLD_PCT = 1.0  # изменение MA60 за 6 недель, ниже которого тренд считается плоским
+BREAKOUT_VOLUME_THRESHOLD_PCT = 120.0  # объём должен быть >=120% среднего, чтобы пробой засчитался
+BREAKOUT_MAX_CHASE_PCT = 5.0  # не гнаться, если цена ушла дальше 5% от уровня пробоя
 
 
 def calc_weekly_ma_trend(weekly_close: pd.Series, price: float) -> dict:
     """
     Screen 1 (недельный, Elder's Triple Screen) — классифицирует тренд по MA10/MA30/MA60.
-
     Бычий ("Tier A") — цена выше MA10 выше MA30 выше MA60 (правильный порядок,
     а не просто "цена выше каждой по отдельности"), и MA60 подтверждённо растёт
     (>1% за 6 недель).
@@ -66,6 +68,7 @@ def find_support_resistance(df_d: pd.DataFrame, price: float, window: int = 3) -
     n = len(df_d)
     resistances = []
     supports = []
+
     for i in range(window, n - window):
         h = df_d["high"].iloc[i]
         if h == df_d["high"].iloc[i - window:i + window + 1].max():
@@ -95,18 +98,14 @@ def analyze_raw(coin: str) -> dict:
     Используется и для одиночного анализа (analyze), и для
     массового сканирования пулом (scanner.py).
 
-    Три состояния сигнала (не два):
-    - BUY   — Screen 1 (недельный) Бычий И Screen 2 (дневной Bear Power) сработал сейчас.
-    - WATCH — Screen 1 Бычий, но Screen 2 ещё не сработал (структура готова,
-              ждём разворота отката). Раньше такие монеты просто терялись в WAIT
-              и сигнал по ним можно было пропустить, хотя тренд уже был бычий.
-    - WAIT  — Screen 1 не Бычий (Медвежий или Боковик), на споте не рассматриваем.
+    Две независимые методики входа, обе используют общий Screen 1 (недельный тренд):
+    - signal_type — методика Элдора (откат Bear Power внутри уже бычьей структуры).
+    - signal_type_breakout — методика Гудмана (пробой 20-дневного максимума
+      закрытия с подтверждением объёмом, без погони за уже ушедшей ценой).
     """
     price = get_current_price(coin)
-
     weekly = get_klines(coin, "1w", limit=110)
     daily = get_klines(coin, "1d", limit=60)
-
     df_w = pd.DataFrame(weekly)
     df_d = pd.DataFrame(daily)
 
@@ -117,14 +116,13 @@ def analyze_raw(coin: str) -> dict:
     volume_ratio_pct = calc_volume_ratio(df_d)
     sr_levels = find_support_resistance(df_d, price)
     elder = calc_elder_ray(df_d)
-
+    breakout = calc_breakout_signal(df_d)
     fg_value, fg_class = get_fear_greed()
     fg_note = fear_greed_note(fg_value, fg_class)
-
     ma_trend = calc_weekly_ma_trend(df_w["close"], price)
+
     weekly_trend_text = "вверх" if weekly_macd["trend_up"] else "вниз"
 
-    # --- Screen 1: недельный тренд, Tier A = MACD-гистограмма растёт И MA-структура Бычий ---
     tier_a = weekly_macd["rising"] and ma_trend["trend"] == "Бычий"
 
     reasoning = []
@@ -152,20 +150,38 @@ def analyze_raw(coin: str) -> dict:
         needs_review = True
         reasoning.append("Недельный тренд — боковик/переходный: сигнала нет, требует ручной проверки")
 
-    # RSI — вторичное подтверждение (дивергенция), не первичный триггер (правило 13).
-    # Не меняет сигнал, только идёт в текст и в счёт.
+    breakout_reasoning = []
+    if tier_a:
+        volume_ok = volume_ratio_pct is not None and volume_ratio_pct >= BREAKOUT_VOLUME_THRESHOLD_PCT
+        if breakout["breakout"] and volume_ok:
+            if breakout["dist_from_breakout_pct"] is not None and breakout["dist_from_breakout_pct"] <= BREAKOUT_MAX_CHASE_PCT:
+                signal_type_breakout = "BUY"
+                breakout_reasoning.append(
+                    f"Пробой 20-дневного максимума закрытия ({breakout['range_high']}), "
+                    f"объём {volume_ratio_pct}% от среднего — подтверждён."
+                )
+            else:
+                signal_type_breakout = "WATCH"
+                breakout_reasoning.append(
+                    f"Пробой уже был ({breakout['range_high']}), но цена ушла на "
+                    f"{breakout['dist_from_breakout_pct']}% — не гонимся, ждём следующей консолидации."
+                )
+        else:
+            signal_type_breakout = "WATCH"
+            breakout_reasoning.append("Screen 1 бычий, но пробоя диапазона ещё не было — в поле зрения.")
+    else:
+        signal_type_breakout = "WAIT"
+        breakout_reasoning.append("Недельный тренд не бычий — пробойную методику не рассматриваем.")
+
     if signal_type in ("BUY", "WATCH") and daily_rsi > 70:
         reasoning.append(f"⚠️ RSI {daily_rsi} — перекуплен, возможна дивергенция, проверь дневной график глазами")
 
-    # Фон Fear & Greed как модификатор (правило 17), не меняет тип сигнала, только предупреждение
     fg_warning = ""
     if fg_value is not None and fg_value >= 75 and signal_type == "BUY":
         fg_warning = "\n⚠️ Рынок в экстремальной жадности — сигнал слабее обычного, возьми меньше объём"
     elif fg_value is not None and fg_value <= 25 and signal_type in ("BUY", "WATCH"):
         fg_warning = "\n👀 Рынок в экстремальном страхе — присмотрись, но жди подтверждения тренда"
 
-    # --- Score для ранжирования при массовом сканировании пулом (сильные сверху) ---
-    # BUY всегда выше WATCH, WATCH всегда выше WAIT.
     if signal_type == "BUY":
         score = 200 - daily_rsi
         if weekly_macd["rising"]:
@@ -176,10 +192,11 @@ def analyze_raw(coin: str) -> dict:
         score = 100 - daily_rsi
     else:
         score = daily_rsi - 100
-        if not weekly_macd["trend_up"]:
-            score -= 20
-        if needs_review:
-            score -= 5
+
+    if not weekly_macd["trend_up"]:
+        score -= 20
+    if needs_review:
+        score -= 5
 
     return {
         "coin": coin.upper(),
@@ -191,6 +208,7 @@ def analyze_raw(coin: str) -> dict:
         "volume_ratio_pct": volume_ratio_pct,
         "sr_levels": sr_levels,
         "elder": elder,
+        "breakout": breakout,
         "fg_value": fg_value,
         "fg_note": fg_note,
         "fg_warning": fg_warning,
@@ -198,29 +216,37 @@ def analyze_raw(coin: str) -> dict:
         "ma_trend": ma_trend,
         "tier_a": tier_a,
         "signal_type": signal_type,
+        "signal_type_breakout": signal_type_breakout,
         "needs_review": needs_review,
         "reasoning": reasoning,
+        "breakout_reasoning": breakout_reasoning,
         "score": round(score, 2),
     }
 
 
 def analyze(coin: str) -> str:
     """Форматированный текстовый анализ по одной монете — вся та же информация,
-    которую видит Вадим при ручной проверке: Screen 1, Screen 2, RSI, объём, S/R, фон."""
+    которую видит Вадим при ручной проверке: Screen 1, Screen 2 (обе методики), RSI, объём, S/R, фон."""
     d = analyze_raw(coin)
-
     lines = []
     lines.append(f"📊 {d['coin']} — анализ")
     lines.append(f"Текущая цена: {d['price']}")
     lines.append("")
     lines.append(f"Screen 1 (недельный MACD): {d['weekly_trend_text']} ({d['weekly_macd']['slope']})")
-    lines.append(f"Screen 1 (недельный MA-тренд): {d['ma_trend']['trend']}"
-                  + (f", MA60 наклон {d['ma_trend']['ma60_slope_pct']}% за 6 нед." if d['ma_trend']['ma60_slope_pct'] is not None else ""))
+    lines.append(
+        f"Screen 1 (недельный MA-тренд): {d['ma_trend']['trend']}"
+        + (f", MA60 наклон {d['ma_trend']['ma60_slope_pct']}% за 6 нед." if d['ma_trend']['ma60_slope_pct'] is not None else "")
+    )
+
     e = d["elder"]
     if e["bull_power"] is not None:
-        lines.append(f"Screen 2 (Elder-ray): Bull Power {e['bull_power']}, Bear Power {e['bear_power']}"
-                      f" ({'растёт' if e['bear_power_rising'] else 'падает'})")
+        lines.append(
+            f"Screen 2 (Elder-ray): Bull Power {e['bull_power']}, Bear Power {e['bear_power']}"
+            f" ({'растёт' if e['bear_power_rising'] else 'падает'})"
+        )
+
     lines.append(f"Дневной RSI (вторично): {d['daily_rsi']}")
+
     if d["volume_ratio_pct"] is not None:
         lines.append(f"Объём: {d['volume_note']} ({d['volume_ratio_pct']}% от среднего)")
     else:
@@ -239,20 +265,22 @@ def analyze(coin: str) -> str:
         entry = round(d["price"], 6)
         sl = round(entry * 0.97, 6)
         tp = round(entry * 1.06, 6)
-        lines.append("💡 СИГНАЛ: Buy")
+        lines.append("💡 СИГНАЛ (методика Элдора, откат): Buy")
         lines.append(f"Вход: {entry}")
         lines.append(f"Stop-Loss: {sl} (-3.0%)")
         lines.append(f"Take-Profit: {tp} (+6.0%)")
         lines.append("R/R: 1:2")
     elif d["signal_type"] == "WATCH":
-        lines.append("💡 СИГНАЛ: Следить (структура бычья, входа ещё нет)")
+        lines.append("💡 СИГНАЛ (методика Элдора, откат): Следить (структура бычья, входа ещё нет)")
     else:
-        lines.append("💡 СИГНАЛ: Ждать")
+        lines.append("💡 СИГНАЛ (методика Элдора, откат): Ждать")
 
-    lines.append("")
     lines.append("Обоснование: " + "; ".join(d["reasoning"]))
-
     if d["fg_warning"]:
         lines.append(d["fg_warning"])
+
+    lines.append("")
+    lines.append(f"💡 СИГНАЛ (методика Гудмана, пробой): {d['signal_type_breakout']}")
+    lines.append("Обоснование: " + "; ".join(d["breakout_reasoning"]))
 
     return "\n".join(lines)
