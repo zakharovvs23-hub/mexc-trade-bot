@@ -280,7 +280,22 @@ def analyze(coin: str) -> str:
         lines.append(d["fg_warning"])
 
     lines.append("")
-    lines.append(f"💡 СИГНАЛ (методика Гудмана, пробой): {d['signal_type_breakout']}")
+    if d["signal_type_breakout"] == "BUY":
+        bo = d["breakout"]
+        entry_bo = round(d["price"], 6)
+        sl_bo = round(bo["range_high"] * 0.99, 6) if bo["range_high"] else round(entry_bo * 0.94, 6)
+        risk_bo = entry_bo - sl_bo
+        tp_bo = round(entry_bo + 2 * risk_bo, 6)
+        lines.append("💡 СИГНАЛ (методика Гудмана, пробой): Buy")
+        lines.append(f"Вход: {entry_bo}")
+        lines.append(f"Stop-Loss: {sl_bo} (чуть ниже линии пробоя {bo['range_high']})")
+        lines.append(f"Take-Profit (ориентир для журнала): {tp_bo}")
+        lines.append("R/R: 1:2 (справочно — правильный выход по этой методике должен быть по трейлинг-стопу, "
+                      "а не по фиксированной цели; трейлинг-стоп в боте пока не реализован)")
+    elif d["signal_type_breakout"] == "WATCH":
+        lines.append("💡 СИГНАЛ (методика Гудмана, пробой): Следить (структура бычья, пробоя ещё нет или он не устоялся)")
+    else:
+        lines.append("💡 СИГНАЛ (методика Гудмана, пробой): Ждать")
     lines.append("Обоснование: " + "; ".join(d["breakout_reasoning"]))
 
     return "\n".join(lines)
