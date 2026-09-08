@@ -73,11 +73,12 @@ def scan_coins(coins: list[str]) -> tuple[list[dict], list[tuple[str, str]]]:
 
 _SIGNAL_EMOJI = {"BUY": "🟢", "WATCH": "🟡", "WAIT": "⚪️"}
 
-
 def format_scan_result(results: list[dict], errors: list[tuple], title: str | None = None) -> str:
     """
     Пулом выводит по каждой монете два сигнала (Элдор/Гудман), цену, недельный тренд,
-    Elder-ray, RSI и score.
+    Elder-ray, RSI и score, плюс отдельным полем — экспериментальный быстрый Screen 1
+    (MA5/13/20, добавлен 2026-09-08), чтобы было видно расхождение со строгим Screen 1
+    прямо в общем скане, а не только в /analyze по одной монете.
     """
     if not results and not errors:
         return "Нет данных для отображения."
@@ -85,28 +86,35 @@ def format_scan_result(results: list[dict], errors: list[tuple], title: str | No
     buy_count = sum(1 for d in results if d["signal_type"] == "BUY")
     watch_count = sum(1 for d in results if d["signal_type"] == "WATCH")
     buy_count_bo = sum(1 for d in results if d["signal_type_breakout"] == "BUY")
+    buy_count_fast = sum(1 for d in results if d["signal_type_fast"] == "BUY")
 
     header = title or f"Результаты сканирования ({len(results)} монет)"
 
     lines = [
         f"📊 {header}, от сильных к слабым: 🟢 BUY(Элдор) {buy_count} | 🟡 WATCH(Элдор) {watch_count} "
-        f"| 🟢 BUY(Гудман) {buy_count_bo}",
+        f"| 🟢 BUY(Гудман) {buy_count_bo} | 🔵 BUY(Быстрый, эксп.) {buy_count_fast}",
         "",
     ]
 
     for i, d in enumerate(results, start=1):
         emoji = _SIGNAL_EMOJI.get(d["signal_type"], "⚪️")
         emoji_bo = _SIGNAL_EMOJI.get(d["signal_type_breakout"], "⚪️")
+        emoji_fast = _SIGNAL_EMOJI.get(d["signal_type_fast"], "⚪️")
         e = d["elder"]
 
         elder_bit = ""
         if d["signal_type"] == "WATCH" and e["bear_power"] is not None:
             elder_bit = f" | BearPower {e['bear_power']}{'↑' if e['bear_power_rising'] else '↓'}"
 
+        if d["ma_trend_fast"]["trend"] != d["ma_trend"]["trend"]:
+            fast_bit = f" | Быстрый {emoji_fast}{d['signal_type_fast']} (недельный {d['ma_trend_fast']['trend']})"
+        else:
+            fast_bit = f" | Быстрый {emoji_fast}{d['signal_type_fast']}"
+
         lines.append(
             f"{i}. {emoji}Элдор/{emoji_bo}Гудман {d['coin']} — {d['signal_type']}/{d['signal_type_breakout']} "
             f"| цена {d['price']} | недельный {d['ma_trend']['trend']} | RSI {d['daily_rsi']}"
-            f"{elder_bit} | score {d['score']:.1f}"
+            f"{elder_bit}{fast_bit} | score {d['score']:.1f}"
         )
 
     if watch_count:
