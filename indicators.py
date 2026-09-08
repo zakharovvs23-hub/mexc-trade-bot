@@ -47,10 +47,32 @@ def calc_volume_signal(volumes: pd.Series, period: int = 20) -> str:
     return "средний"
 
 def calc_elder_ray(df_d: pd.DataFrame, period: int = 13) -> dict:
+    """
+    Screen 2 (разворот Bear Power) + Screen 3 (добавлен 2026-09-08).
+
+    Классический Triple Screen Элдора состоит из трёх экранов, а не двух:
+    Screen 1 — недельный тренд, Screen 2 — дневной осциллятор, показывающий
+    откат, Screen 3 — точный вход: ордер на покупку чуть выше максимума
+    предыдущего дня, который срабатывает только при реальном подтверждении
+    ценой, а не сразу по развороту индикатора (у Элдора — трейлинг buy stop
+    внутри дня; здесь, без внутридневных данных, берём дневной аналог —
+    закрытие выше хая предыдущего дня). Раньше Screen 2 сам был сигналом BUY.
+
+    Ретротест на реальных данных VVV (07.09.2026, сделка со стопом): в этом
+    конкретном случае screen3_confirm не изменил бы исход — цена подтвердила
+    разворот в тот же день, что сработал Screen 2 (сильный дневной свечной
+    рост сразу дал и разворот Bear Power, и закрытие выше вчерашнего хая).
+    То есть это НЕ доказанное исправление прошлых убытков, а честно
+    добавленный недостающий кусок методики Элдора — защита от случаев, когда
+    индикатор разворачивается, а цена ещё не подтвердила это движением
+    (отдельный, более распространённый сценарий, который в наших 4 сделках
+    пока не встретился).
+    """
     if len(df_d) < period + 2:
         return {
             "bull_power": None, "bear_power": None, "bear_power_prev": None,
             "bear_power_rising": False, "screen2_trigger": False,
+            "screen3_confirm": False, "prev_high": None,
         }
     ema = df_d["close"].ewm(span=period, adjust=False).mean()
     bull_power = df_d["high"] - ema
@@ -60,12 +82,19 @@ def calc_elder_ray(df_d: pd.DataFrame, period: int = 13) -> dict:
     brp_prev = float(bear_power.iloc[-2])
     bear_power_rising = brp_last > brp_prev
     screen2_trigger = (brp_last < 0) and bear_power_rising and (bp_last > 0)
+
+    today_close = float(df_d["close"].iloc[-1])
+    prev_high = float(df_d["high"].iloc[-2])
+    screen3_confirm = today_close > prev_high
+
     return {
         "bull_power": round(bp_last, 6),
         "bear_power": round(brp_last, 6),
         "bear_power_prev": round(brp_prev, 6),
         "bear_power_rising": bear_power_rising,
         "screen2_trigger": screen2_trigger,
+        "screen3_confirm": screen3_confirm,
+        "prev_high": round(prev_high, 6),
     }
 
 def calc_breakout_signal(df_d: pd.DataFrame, period: int = 20) -> dict:
