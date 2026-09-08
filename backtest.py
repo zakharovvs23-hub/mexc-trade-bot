@@ -1,7 +1,7 @@
 """
 Бэктест торговой стратегии по историческим дневным данным (~1 год).
 Правило теперь совпадает с живой логикой signals.py (Elder's Triple Screen):
-покупка при недельном Screen 1 = Бычий (MACD-гистограмма растёт, MA10>MA30>MA60,
+покупка при недельном Screen 1 = Бычий (MACD-гистограмма растёт, MA10>MA30>
 MA60 растёт >1% за 6 недель) И дневном Screen 2 = Bear Power отрицательный,
 но разворачивается вверх при Bull Power > 0. RSI в правило входа не входит —
 он вторичное подтверждение, как и в живом сканере.
@@ -9,13 +9,19 @@ MA60 растёт >1% за 6 недель) И дневном Screen 2 = Bear Pow
 Недельная структура для истории приближённо считается ресемплингом дневных
 закрытий в 7-дневные свечи (MEXC отдаёт недельные свечи только текущим
 окном, а не произвольным диапазоном в прошлом).
+
+Буфер данных увеличен с 90 до 500 дней (08.09.2026) — со старым буфером
+запрос всегда возвращал меньше 66 недель после ресемплинга (365+90=455
+дней = ~65 недель), поэтому недельный Screen 1 падал с ошибкой
+"Недостаточно исторических данных" для ЛЮБОЙ монеты, включая BTC —
+дело было не в реальной истории монеты, а в том, что бот просто не
+запрашивал её в достаточном объёме.
 """
 import pandas as pd
 from mexc_api import get_klines
 
 FLAT_MA_THRESHOLD_PCT = 1.0
 ELDER_PERIOD = 13
-
 
 def _weekly_tier_a_series(daily_close: pd.Series) -> pd.Series:
     """Screen 1 по каждому дню истории: True, если на тот момент недельная
@@ -41,7 +47,6 @@ def _weekly_tier_a_series(daily_close: pd.Series) -> pd.Series:
     tier_a = hist_rising & bull_order & (ma60_slope_pct > FLAT_MA_THRESHOLD_PCT)
     return tier_a.reindex(daily_close.index, method="ffill").fillna(False)
 
-
 def _daily_screen2_series(df: pd.DataFrame, period: int = ELDER_PERIOD) -> pd.Series:
     """Screen 2 по каждому дню: True, если Bear Power отрицательный, но растёт
     (разворот отката), при Bull Power положительном — та же логика, что в
@@ -52,14 +57,13 @@ def _daily_screen2_series(df: pd.DataFrame, period: int = ELDER_PERIOD) -> pd.Se
     bear_rising = bear_power > bear_power.shift(1)
     return (bear_power < 0) & bear_rising & (bull_power > 0)
 
-
 def backtest(coin: str, days: int = 365, tp_pct: float = 0.06, sl_pct: float = 0.03,
              max_hold_days: int = 30) -> dict:
     """
     Прогоняет правило BUY (Screen 1 Бычий И Screen 2 сработал) по историческим
     данным и считает гипотетическую доходность.
     """
-    klines = get_klines(coin, "1d", limit=min(days + 90, 1000))
+    klines = get_klines(coin, "1d", limit=min(days + 500, 1000))
     df = pd.DataFrame(klines)
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
     df = df.set_index("open_time")
@@ -125,7 +129,6 @@ def backtest(coin: str, days: int = 365, tp_pct: float = 0.06, sl_pct: float = 0
         "tp_pct": tp_pct,
         "sl_pct": sl_pct,
     }
-
 
 def format_backtest(result: dict) -> str:
     if result["trades"] == 0:
