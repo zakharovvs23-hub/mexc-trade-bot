@@ -7,7 +7,6 @@ from fear_greed import get_fear_greed, fear_greed_note
 FLAT_MA_THRESHOLD_PCT = 1.0  # изменение MA60 за 6 недель, ниже которого тренд считается плоским
 BREAKOUT_VOLUME_THRESHOLD_PCT = 120.0  # объём должен быть >=120% среднего, чтобы пробой засчитался
 BREAKOUT_MAX_CHASE_PCT = 5.0  # не гнаться, если цена ушла дальше 5% от уровня пробоя
-
 def calc_weekly_ma_trend(weekly_close: pd.Series, price: float) -> dict:
     """
     Screen 1 (недельный, Elder's Triple Screen) — классифицирует тренд по MA10/MA30/MA60.
@@ -46,7 +45,48 @@ def calc_weekly_ma_trend(weekly_close: pd.Series, price: float) -> dict:
         "ma60": round(ma60_now, 6),
         "ma60_slope_pct": round(ma60_slope_pct, 2),
     }
+def calc_weekly_ma_trend_fast(weekly_close: pd.Series, price: float) -> dict:
+    """
+    Быстрый вариант Screen 1 (эксперимент, добавлен 2026-09-08) — та же логика,
+    что calc_weekly_ma_trend, но с более короткими MA (5/13/20 недель вместо
+    10/30/60) и укороченным окном наклона (4 недели вместо 6).
 
+    Причина: 60-недельная MA (больше года) слишком медленная для крипты —
+    на бэктесте реальных монет (BTC/XMR/ZEC) она почти никогда не успевала
+    признать тренд бычьим, сигналов было мало. Быстрая версия считается
+    ПАРАЛЛЕЛЬНО со строгой, не заменяет её — чтобы сравнить, сколько
+    дополнительных сигналов она даёт и насколько они прибыльны, прежде
+    чем делать её основной.
+    """
+    if len(weekly_close) < 24:
+        return {"trend": "Недостаточно данных", "ma5": None, "ma13": None, "ma20": None, "ma20_slope_pct": None}
+
+    ma5 = weekly_close.rolling(5).mean()
+    ma13 = weekly_close.rolling(13).mean()
+    ma20 = weekly_close.rolling(20).mean()
+
+    ma5_now = ma5.iloc[-1]
+    ma13_now = ma13.iloc[-1]
+    ma20_now = ma20.iloc[-1]
+    ma20_prev = ma20.iloc[-5]  # 4 недели назад
+    ma20_slope_pct = (ma20_now - ma20_prev) / ma20_prev * 100
+
+    bull_order = price > ma5_now > ma13_now > ma20_now
+
+    if bull_order and ma20_slope_pct > FLAT_MA_THRESHOLD_PCT:
+        trend = "Бычий"
+    elif price < ma20_now and ma20_slope_pct < -FLAT_MA_THRESHOLD_PCT:
+        trend = "Медвежий"
+    else:
+        trend = "Боковик"
+
+    return {
+        "trend": trend,
+        "ma5": round(ma5_now, 6),
+        "ma13": round(ma13_now, 6),
+        "ma20": round(ma20_now, 6),
+        "ma20_slope_pct": round(ma20_slope_pct, 2),
+    }
 def calc_volume_ratio(df_d: pd.DataFrame):
     """Текущий дневной объём в % от среднего объёма за предыдущий период."""
     if len(df_d) < 2:
@@ -86,7 +126,6 @@ def find_support_resistance(df_d: pd.DataFrame, price: float, window: int = 3) -
         "support": round(nearest_support, 6) if nearest_support is not None else None,
         "support_dist_pct": round((price - nearest_support) / price * 100, 2) if nearest_support is not None else None,
     }
-
 def analyze_raw(coin: str) -> dict:
     """
     Считает Elder's Triple Screen целиком и итоговый сигнал по монете,
@@ -118,6 +157,7 @@ def analyze_raw(coin: str) -> dict:
     fg_value, fg_class = get_fear_greed()
     fg_note = fear_greed_note(fg_value, fg_class)
     ma_trend = calc_weekly_ma_trend(df_w["close"], price)
+    ma_trend_fast = calc_weekly_ma_trend_fast(df_w["close"], price)
 
     weekly_trend_text = "вверх" if weekly_macd["trend_up"] else "вниз"
 
@@ -147,6 +187,25 @@ def analyze_raw(coin: str) -> dict:
         signal_type = "WAIT"
         needs_review = True
         reasoning.append("Недельный тренд — боковик/переходный: сигнала нет, требует ручной проверки")
+    reasoning_fast = []
+    if weekly_macd["rising"] and ma_trend_fast["trend"] == "Бычий":
+        if elder["screen2_trigger"]:
+            signal_type_fast = "BUY"
+            reasoning_fast.append(
+                "Screen 1 (быстрый, MA20, эксперимент): недельный тренд Бычий. "
+                "Screen 2: Bear Power отрицательный, но разворачивается вверх — точка входа."
+            )
+        else:
+            signal_type_fast = "WATCH"
+            reasoning_fast.append(
+                "Screen 1 (быстрый, MA20, эксперимент): структура готова, Screen 2 ещё не сработал."
+            )
+    elif ma_trend_fast["trend"] == "Медвежий" or not weekly_macd["trend_up"]:
+        signal_type_fast = "WAIT"
+        reasoning_fast.append("Недельный тренд (быстрый) не бычий — сигнала нет")
+    else:
+        signal_type_fast = "WAIT"
+        reasoning_fast.append("Недельный тренд (быстрый) — боковик/переходный")
 
     breakout_reasoning = []
     if tier_a:
@@ -176,7 +235,6 @@ def analyze_raw(coin: str) -> dict:
     else:
         signal_type_breakout = "WAIT"
         breakout_reasoning.append("Недельный тренд не бычий — пробойную методику не рассматриваем.")
-
     if signal_type in ("BUY", "WATCH") and daily_rsi > 70:
         reasoning.append(f"⚠️ RSI {daily_rsi} — перекуплен, возможна дивергенция, проверь дневной график глазами")
 
@@ -201,7 +259,6 @@ def analyze_raw(coin: str) -> dict:
         score -= 20
     if needs_review:
         score -= 5
-
     return {
         "coin": coin.upper(),
         "price": price,
@@ -219,15 +276,17 @@ def analyze_raw(coin: str) -> dict:
         "fg_warning": fg_warning,
         "weekly_trend_text": weekly_trend_text,
         "ma_trend": ma_trend,
+        "ma_trend_fast": ma_trend_fast,
         "tier_a": tier_a,
         "signal_type": signal_type,
         "signal_type_breakout": signal_type_breakout,
+        "signal_type_fast": signal_type_fast,
         "needs_review": needs_review,
         "reasoning": reasoning,
         "breakout_reasoning": breakout_reasoning,
+        "reasoning_fast": reasoning_fast,
         "score": round(score, 2),
     }
-
 def analyze(coin: str) -> str:
     """Форматированный текстовый анализ по одной монете — вся та же информация,
     которую видит Вадим при ручной проверке: Screen 1, Screen 2 (обе методики), RSI, объём, S/R, фон."""
@@ -286,7 +345,6 @@ def analyze(coin: str) -> str:
     lines.append("Обоснование: " + "; ".join(d["reasoning"]))
     if d["fg_warning"]:
         lines.append(d["fg_warning"])
-
     lines.append("")
     if d["signal_type_breakout"] == "BUY":
         bo = d["breakout"]
@@ -305,5 +363,14 @@ def analyze(coin: str) -> str:
     else:
         lines.append("💡 СИГНАЛ (методика Гудмана, пробой): Ждать")
     lines.append("Обоснование: " + "; ".join(d["breakout_reasoning"]))
+
+    lines.append("")
+    if d["signal_type_fast"] == "BUY":
+        lines.append("💡 СИГНАЛ (быстрый Screen 1, MA5/13/20, ЭКСПЕРИМЕНТ): Buy — для сравнения, не для реальных сделок пока")
+    elif d["signal_type_fast"] == "WATCH":
+        lines.append("💡 СИГНАЛ (быстрый Screen 1, MA5/13/20, ЭКСПЕРИМЕНТ): Следить")
+    else:
+        lines.append("💡 СИГНАЛ (быстрый Screen 1, MA5/13/20, ЭКСПЕРИМЕНТ): Ждать")
+    lines.append("Обоснование: " + "; ".join(d["reasoning_fast"]))
 
     return "\n".join(lines)
