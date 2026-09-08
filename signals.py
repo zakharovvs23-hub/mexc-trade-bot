@@ -167,11 +167,19 @@ def analyze_raw(coin: str) -> dict:
     needs_review = False
 
     if tier_a:
-        if elder["screen2_trigger"]:
+        if elder["screen2_trigger"] and elder["screen3_confirm"]:
             signal_type = "BUY"
             reasoning.append(
                 "Screen 1: недельный тренд Бычий (MACD-гистограмма растёт, MA10>MA30>MA60). "
-                "Screen 2: Bear Power отрицательный, но разворачивается вверх при Bull Power > 0 — точка входа."
+                "Screen 2: Bear Power отрицательный, но разворачивается вверх при Bull Power > 0. "
+                f"Screen 3: цена подтвердила разворот — закрытие выше максимума предыдущего дня ({elder['prev_high']}) — точка входа."
+            )
+        elif elder["screen2_trigger"] and not elder["screen3_confirm"]:
+            signal_type = "WATCH"
+            reasoning.append(
+                "Screen 1: недельный тренд Бычий. Screen 2: разворот Bear Power уже начался. "
+                f"Screen 3 ещё не подтвердил: закрытие пока не выше максимума предыдущего дня ({elder['prev_high']}) — "
+                "ждём реального ценового подтверждения, а не только разворота индикатора."
             )
         else:
             signal_type = "WATCH"
@@ -189,11 +197,18 @@ def analyze_raw(coin: str) -> dict:
         reasoning.append("Недельный тренд — боковик/переходный: сигнала нет, требует ручной проверки")
     reasoning_fast = []
     if weekly_macd["rising"] and ma_trend_fast["trend"] == "Бычий":
-        if elder["screen2_trigger"]:
+        if elder["screen2_trigger"] and elder["screen3_confirm"]:
             signal_type_fast = "BUY"
             reasoning_fast.append(
                 "Screen 1 (быстрый, MA20, эксперимент): недельный тренд Бычий. "
-                "Screen 2: Bear Power отрицательный, но разворачивается вверх — точка входа."
+                "Screen 2: Bear Power отрицательный, но разворачивается вверх. "
+                f"Screen 3: цена подтвердила — закрытие выше максимума предыдущего дня ({elder['prev_high']}) — точка входа."
+            )
+        elif elder["screen2_trigger"] and not elder["screen3_confirm"]:
+            signal_type_fast = "WATCH"
+            reasoning_fast.append(
+                "Screen 1 (быстрый, MA20, эксперимент): структура готова, Screen 2 сработал, но Screen 3 "
+                f"(цена ещё не закрылась выше максимума предыдущего дня, {elder['prev_high']}) не подтвердил."
             )
         else:
             signal_type_fast = "WATCH"
