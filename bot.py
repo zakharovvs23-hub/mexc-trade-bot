@@ -4,7 +4,7 @@ import os
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-from signals import analyze, analyze_raw
+from signals import analyze
 from scanner import scan_coins, format_scan_result, TOP_COINS, POOLS
 from backtest import backtest, format_backtest
 
@@ -36,13 +36,22 @@ WELCOME = (
     "/watch — показать вотчлист автопроверки\n"
     "/watch XMR VVV — добавить монеты в вотчлист автопроверки\n"
     "/unwatch XMR — убрать монету из вотчлиста\n\n"
-    "Монеты из вотчлиста я проверяю сам в фоне каждые 15 минут и пишу тебе сразу, "
-    "как только по одной из них появится реальный сигнал BUY — не нужно самому сидеть и сканировать.\n\n"
+    "По умолчанию в вотчлисте твой обычный список из 24 монет (тот же, что в регулярных /scan) — "
+    "я проверяю его сам в фоне каждые 15 минут и пишу тебе сразу, как только по любой из них "
+    "появится реальный сигнал BUY — не нужно самому сидеть и сканировать.\n\n"
     "Ордера я не выставляю и в MEXC не захожу — только анализ. Решение и покупку делаешь ты сам."
 )
 
 CHECK_INTERVAL_SECONDS = 15 * 60  # автопроверка вотчлиста каждые 15 минут
-DEFAULT_WATCHLIST = ["XMR", "VVV"]
+
+# Тот же список из 24 монет, что Вадим обычно прогоняет вручную через /scan — используем его
+# как вотчлист по умолчанию (2026-09-10, по его просьбе: "как ты ему задал 24 монеты, чтобы
+# проверял, которые мы выбрали"), а не узкий список из 1-2 монет.
+DEFAULT_WATCHLIST = [
+    "HYPE", "XMR", "VVV", "ZEC", "TRX", "RAY", "ETHFI", "VELO", "CAKE", "NEAR",
+    "LIT", "PROM", "AERO", "SOL", "LINK", "PYTH", "CRV", "UNI", "XVS", "GMX",
+    "JUP", "CVX", "MORPHO", "JST",
+]
 CHAT_ID_FILE = "chat_id.txt"
 WATCHLIST_FILE = "watchlist.txt"
 
@@ -83,7 +92,6 @@ def _save_watchlist(coins: list[str]):
     except Exception:
         logger.exception("Не смог сохранить вотчлист")
 
-
 def _chunk_text(text: str, limit: int = TELEGRAM_MSG_LIMIT) -> list[str]:
     """Режет длинный текст на части по границам строк, не разрывая строку пополам,
     чтобы не упереться в лимит Telegram (4096 символов на сообщение)."""
@@ -118,6 +126,7 @@ async def _capture_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(WELCOME)
+
 
 async def handle_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     coin = update.message.text.strip()
@@ -154,7 +163,6 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception("Ошибка сканирования")
         await update.message.reply_text(f"Ошибка при сканировании: {e}")
-
 
 async def pool_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
@@ -196,6 +204,7 @@ async def pool_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Ошибка сканирования")
         await update.message.reply_text(f"Ошибка при сканировании: {e}")
 
+
 async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
@@ -220,7 +229,6 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception("Ошибка бэктеста")
         await update.message.reply_text(f"Ошибка бэктеста: {e}")
-
 
 async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
@@ -267,18 +275,21 @@ async def unwatch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _watch_job(context: ContextTypes.DEFAULT_TYPE):
     """Фоновая автопроверка вотчлиста. Алертит только на переходе в BUY (не на каждом тике),
-    чтобы не спамить одним и тем же сигналом каждые 15 минут."""
+    чтобы не спамить одним и тем же сигналом каждые 15 минут.
+
+    Использует ту же scan_coins(), что и /scan и /pool — проверенный пулом путь, а не отдельный
+    цикл analyze_raw() по монете: одинаковая нагрузка на MEXC API что при ручном /scan 24, что
+    при автопроверке, только теперь она идёт каждые 15 минут сама, без участия Вадима."""
     chat_id = _load_chat_id()
     if not chat_id:
         return  # ещё ни разу не писал боту после рестарта — некому слать
 
-    for coin in _load_watchlist():
-        try:
-            d = analyze_raw(coin)
-        except Exception:
-            logger.exception("Ошибка автопроверки вотчлиста по %s", coin)
-            continue
+    results, errors = scan_coins(_load_watchlist())
+    if errors:
+        logger.warning("Автопроверка вотчлиста: не удалось получить данные по %s", ", ".join(c for c, _ in errors))
 
+    for d in results:
+        coin = d["coin"]
         cur_elder = d["signal_type"]
         cur_breakout = d["signal_type_breakout"]
         prev = _last_signal_state.get(coin)
