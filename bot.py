@@ -4,7 +4,7 @@ import os
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-from signals import analyze
+from signals import analyze, format_analysis
 from scanner import scan_coins, format_scan_result, TOP_COINS, POOLS
 from backtest import backtest, format_backtest
 
@@ -300,13 +300,16 @@ async def _watch_job(context: ContextTypes.DEFAULT_TYPE):
 
         prev_elder, prev_breakout = prev
         if cur_elder == "BUY" and prev_elder != "BUY":
-            text = analyze(coin)
+            # Строим текст алерта из того же d, что дал BUY (не повторный запрос analyze(coin) —
+            # см. format_analysis() в signals.py: между двумя живыми запросами цена успевала
+            # откатиться, и текст алерта мог противоречить его же заголовку).
+            text = format_analysis(d)
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=f"🔔 Автосигнал из вотчлиста: {coin} — методика Элдора дала BUY!\n\n{text}",
             )
         elif cur_breakout == "BUY" and prev_breakout != "BUY":
-            text = analyze(coin)
+            text = format_analysis(d)
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=f"🔔 Автосигнал из вотчлиста: {coin} — методика Гудмана (пробой) дала BUY!\n\n{text}",
