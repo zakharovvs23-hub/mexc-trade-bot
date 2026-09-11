@@ -227,8 +227,7 @@ def analyze_raw(coin: str) -> dict:
         volume_ok = breakout["breakout_day_volume_pct"] is not None and breakout["breakout_day_volume_pct"] >= BREAKOUT_VOLUME_THRESHOLD_PCT
         if breakout["breakout_confirmed"] and volume_ok:
             if breakout["dist_from_breakout_pct"] is not None and breakout["dist_from_breakout_pct"] <= BREAKOUT_MAX_CHASE_PCT:
-                signal_type_breakout = "BUY"
-                breakout_reasoning.append(
+                signal_type_breakout = "BUY"   breakout_reasoning.append(
                     f"Пробой 20-дневного максимума закрытия ({breakout['range_high']}) подтверждён на следующий день "
                     f"(цена удержалась выше уровня), объём на свече пробоя {breakout['breakout_day_volume_pct']}% от среднего."
                 )
@@ -306,6 +305,25 @@ def analyze(coin: str) -> str:
     """Форматированный текстовый анализ по одной монете — вся та же информация,
     которую видит Вадим при ручной проверке: Screen 1, Screen 2 (обе методики), RSI, объём, S/R, фон."""
     d = analyze_raw(coin)
+    return format_analysis(d)
+
+
+def format_analysis(d: dict) -> str:
+    """
+    Форматирует уже посчитанный analyze_raw()-результат в текст.
+
+    Вынесено из analyze() отдельно (2026-09-11), потому что _watch_job в bot.py
+    раньше вызывал analyze(coin) ЗАНОВО после того, как уже получил сигнал BUY
+    из scan_coins() — второй отдельный живой запрос к API парой секунд позже.
+    Screen 3 (screen3_confirm = today_close > prev_high) считается по ЕЩЁ НЕ
+    закрытой дневной свече, то есть today_close — это фактически текущая цена:
+    она успевает измениться между первым запросом (scan_coins, дал BUY) и вторым
+    (analyze(coin) для текста алерта) — и signal_type ко второму запросу мог уже
+    откатиться обратно в WATCH. В сообщении получался разнобой: заголовок "дала
+    BUY!", а тело — "Следить, входа ещё нет". Теперь _watch_job строит текст
+    алерта из ТОГО ЖЕ словаря d, что дал BUY — одного снимка данных, без второго
+    похода в API и без риска, что цена успеет откатиться между двумя вызовами.
+    """
     lines = []
     lines.append(f"📊 {d['coin']} — анализ")
     lines.append(f"Текущая цена: {d['price']}")
