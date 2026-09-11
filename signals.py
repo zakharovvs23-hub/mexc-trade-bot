@@ -70,7 +70,6 @@ def calc_weekly_ma_trend_fast(weekly_close: pd.Series, price: float) -> dict:
     ma20_now = ma20.iloc[-1]
     ma20_prev = ma20.iloc[-5]  # 4 недели назад
     ma20_slope_pct = (ma20_now - ma20_prev) / ma20_prev * 100
-
     bull_order = price > ma5_now > ma13_now > ma20_now
 
     if bull_order and ma20_slope_pct > FLAT_MA_THRESHOLD_PCT:
@@ -227,7 +226,8 @@ def analyze_raw(coin: str) -> dict:
         volume_ok = breakout["breakout_day_volume_pct"] is not None and breakout["breakout_day_volume_pct"] >= BREAKOUT_VOLUME_THRESHOLD_PCT
         if breakout["breakout_confirmed"] and volume_ok:
             if breakout["dist_from_breakout_pct"] is not None and breakout["dist_from_breakout_pct"] <= BREAKOUT_MAX_CHASE_PCT:
-                signal_type_breakout = "BUY"   breakout_reasoning.append(
+                signal_type_breakout = "BUY"
+                breakout_reasoning.append(
                     f"Пробой 20-дневного максимума закрытия ({breakout['range_high']}) подтверждён на следующий день "
                     f"(цена удержалась выше уровня), объём на свече пробоя {breakout['breakout_day_volume_pct']}% от среднего."
                 )
@@ -342,7 +342,6 @@ def format_analysis(d: dict) -> str:
         )
 
     lines.append(f"Дневной RSI (вторично): {d['daily_rsi']}")
-
     if d["volume_ratio_pct"] is not None:
         lines.append(f"Объём: {d['volume_note']} ({d['volume_ratio_pct']}% от среднего)")
     else:
