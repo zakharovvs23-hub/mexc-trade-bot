@@ -39,8 +39,9 @@ WELCOME = (
     "/watch XMR VVV — добавить монеты в вотчлист автопроверки\n"
     "/unwatch XMR — убрать монету из вотчлиста\n\n"
     "По умолчанию в вотчлисте твой обычный список из 24 монет (тот же, что в регулярных /scan) — "
-    "я проверяю его сам в фоне каждые 15 минут и пишу тебе сразу, как только по любой из них "
-    "появится реальный сигнал BUY — не нужно самому сидеть и сканировать.\n\n"
+    "я проверяю его сам в фоне каждые 15 минут и пишу тебе сразу, как только по любой из монет "
+    "появится реальный сигнал BUY — по методике Элдора, Гудмана (пробой) или быстрой (MA5/13/20) — "
+    "не нужно самому сидеть и сканировать.\n\n"
     "Плюс раз в 2 часа я сам сканирую вообще все монеты (TOP_COINS + пулы A-E, ~230 тикеров) "
     "и добавляю в отдельный авто-вотчлист те, у которых недельный тренд уже подходящий — их я "
     "тоже проверяю каждые 15 минут вместе с твоим списком. Монеты, у которых тренд перестал "
@@ -73,9 +74,12 @@ WATCHLIST_FILE = "watchlist.txt"
 FULL_SCAN_INTERVAL_SECONDS = 2 * 60 * 60
 AUTO_WATCHLIST_FILE = "auto_watchlist.txt"
 
-# coin -> (signal_type Элдора, signal_type_breakout Гудмана) на момент последней автопроверки.
-# Нужен, чтобы алертить только на РЕАЛЬНОМ переходе в BUY, а не спамить на каждой проверке.
-_last_signal_state: dict[str, tuple[str, str]] = {}
+# coin -> (signal_type Элдора, signal_type_breakout Гудмана, signal_type_fast Быстрой методики)
+# на момент последней автопроверки. Нужен, чтобы алертить только на РЕАЛЬНОМ переходе в BUY,
+# а не спамить на каждой проверке. Быстрая методика добавлена в кортеж 2026-09-12 — Вадим
+# по итогам бэктеста (13 сделок, ~69% win-rate на трёх монетах, сравнимо со строгой методикой)
+# решил работать по всем трём методикам, а не только по Элдору и Гудману.
+_last_signal_state: dict[str, tuple[str, str, str]] = {}
 
 # Время последнего УСПЕШНОГО прогона _watch_job / _full_scan_job (UTC, в памяти процесса —
 # сбрасывается при рестарте бота, это нормально: пустое значение после рестарта — честный
@@ -315,7 +319,7 @@ async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{FULL_SCAN_INTERVAL_SECONDS // 3600} ч, недельный тренд уже подходящий): "
             + (f"{len(auto)} монет — {', '.join(auto)}" if auto else "пока пусто") + "\n"
             f"Автопроверка обоих списков вместе каждые {CHECK_INTERVAL_SECONDS // 60} мин, алерт только при "
-            "реальном переходе в BUY (у любой из двух методик — Элдор или Гудман).\n\n"
+            "реальном переходе в BUY (у любой из трёх методик — Элдор, Гудман или Быстрая).\n\n"
             "Использование: /watch МОНЕТА [МОНЕТА2 ...] — добавить в вотчлист"
         )
         return
@@ -372,27 +376,41 @@ async def _watch_job(context: ContextTypes.DEFAULT_TYPE):
         coin = d["coin"]
         cur_elder = d["signal_type"]
         cur_breakout = d["signal_type_breakout"]
+        cur_fast = d["signal_type_fast"]
         prev = _last_signal_state.get(coin)
-        _last_signal_state[coin] = (cur_elder, cur_breakout)
+        _last_signal_state[coin] = (cur_elder, cur_breakout, cur_fast)
 
         if prev is None:
             continue  # первая проверка после рестарта — просто фиксируем базу, без алерта
 
-        prev_elder, prev_breakout = prev
+        prev_elder, prev_breakout, prev_fast = prev
+        # Строим текст алерта из того же d, что дал BUY (не повторный запрос analyze(coin) —
+        # см. format_analysis() в signals.py: между двумя живыми запросами цена успевала
+        # откатиться, и текст алерта мог противоречить его же заголовку).
+        #
+        # Три независимые проверки (не if/elif), а не один if/elif на все методики —
+        # 2026-09-12: раньше Элдор и Гудман были в одной if/elif цепочке, и если обе давали
+        # BUY в один и тот же цикл проверки, алерт по Гудману терялся (elif проверялся, только
+        # если elder-ветка не сработала). С добавлением третьей методики это стало бы ещё
+        # заметнее, поэтому теперь каждая методика алертит независимо — за один цикл может
+        # прийти хоть три отдельных сообщения, если все три одновременно дали BUY.
         if cur_elder == "BUY" and prev_elder != "BUY":
-            # Строим текст алерта из того же d, что дал BUY (не повторный запрос analyze(coin) —
-            # см. format_analysis() в signals.py: между двумя живыми запросами цена успевала
-            # откатиться, и текст алерта мог противоречить его же заголовку).
             text = format_analysis(d)
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=f"🔔 Автосигнал из вотчлиста: {coin} — методика Элдора дала BUY!\n\n{text}",
             )
-        elif cur_breakout == "BUY" and prev_breakout != "BUY":
+        if cur_breakout == "BUY" and prev_breakout != "BUY":
             text = format_analysis(d)
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=f"🔔 Автосигнал из вотчлиста: {coin} — методика Гудмана (пробой) дала BUY!\n\n{text}",
+            )
+        if cur_fast == "BUY" and prev_fast != "BUY":
+            text = format_analysis(d)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"🔔 Автосигнал из вотчлиста: {coin} — быстрая методика (эксперимент, MA5/13/20) дала BUY!\n\n{text}",
             )
 
 
@@ -469,8 +487,9 @@ async def _heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
             "Возможно, бот перезапустился или завис — стоит проверить."
         )
 
-    buy_count = sum(1 for (e, b) in _last_signal_state.values() if e == "BUY" or b == "BUY")
-    watch_count = sum(1 for (e, b) in _last_signal_state.values() if e == "WATCH" or b == "WATCH")
+    # Кортеж состояния теперь тройной (Элдор, Гудман, Быстрая) — 2026-09-12, см. _watch_job.
+    buy_count = sum(1 for state in _last_signal_state.values() if "BUY" in state)
+    watch_count = sum(1 for state in _last_signal_state.values() if "WATCH" in state)
 
     now_local = datetime.now(timezone.utc).astimezone(_NVRSK_TZ)
     text = (
