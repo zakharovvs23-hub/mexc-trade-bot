@@ -32,8 +32,9 @@ WELCOME = (
     "/pool a (b, c, d, e) — просканировать пулом весь фиксированный пул ротации, "
     "без необходимости присылать список тикеров вручную\n"
     "/pool all — просканировать все пулы A-E подряд (199 тикеров, займёт время)\n"
-    "/backtest BTC — прогнать стратегию по BTC за ~год\n"
+    "/backtest BTC — прогнать стратегию по BTC за ~год (строгая методика)\n"
     "/backtest BTC tp=0.08 sl=0.04 — то же со своими Take-Profit/Stop-Loss\n"
+    "/backtest BTC fast — то же, но по быстрой эксперим. методике (MA5/13/20)\n"
     "/watch — показать вотчлист автопроверки\n"
     "/watch XMR VVV — добавить монеты в вотчлист автопроверки\n"
     "/unwatch XMR — убрать монету из вотчлиста\n\n"
@@ -276,22 +277,28 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
         await update.message.reply_text(
-            "Использование: /backtest МОНЕТА [tp=0.06] [sl=0.03]\n"
-            "Например: /backtest BTC или /backtest ETH tp=0.08 sl=0.04"
+            "Использование: /backtest МОНЕТА [tp=0.06] [sl=0.03] [fast]\n"
+            "Например: /backtest BTC, /backtest ETH tp=0.08 sl=0.04 или /backtest XMR fast"
         )
         return
 
     coin = args[0]
     tp_pct, sl_pct = 0.06, 0.03
+    methodology = "strict"
     for a in args[1:]:
         if a.startswith("tp="):
             tp_pct = float(a.split("=")[1])
         elif a.startswith("sl="):
             sl_pct = float(a.split("=")[1])
+        elif a.lower() in ("fast", "быстрый", "быстрая"):
+            methodology = "fast"
+        elif a.lower() in ("strict", "строгий", "строгая"):
+            methodology = "strict"
 
-    await update.message.reply_text(f"Считаю бэктест по {coin.upper()} за ~год, подожди немного...")
+    label = "быстрой методике" if methodology == "fast" else "строгой методике"
+    await update.message.reply_text(f"Считаю бэктест по {coin.upper()} за ~год ({label}), подожди немного...")
     try:
-        result = backtest(coin, tp_pct=tp_pct, sl_pct=sl_pct)
+        result = backtest(coin, tp_pct=tp_pct, sl_pct=sl_pct, methodology=methodology)
         await update.message.reply_text(format_backtest(result))
     except Exception as e:
         logger.exception("Ошибка бэктеста")
