@@ -5,7 +5,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 from signals import analyze, format_analysis
-from scanner import scan_coins, format_scan_result, TOP_COINS, POOLS
+from scanner import scan_coins, format_scan_result, TOP_COINS, POOLS, all_pool_coins
 from backtest import backtest, format_backtest
 
 logging.basicConfig(level=logging.INFO)
@@ -39,6 +39,10 @@ WELCOME = (
     "По умолчанию в вотчлисте твой обычный список из 24 монет (тот же, что в регулярных /scan) — "
     "я проверяю его сам в фоне каждые 15 минут и пишу тебе сразу, как только по любой из них "
     "появится реальный сигнал BUY — не нужно самому сидеть и сканировать.\n\n"
+    "Плюс раз в 2 часа я сам сканирую вообще все монеты (TOP_COINS + пулы A-E, ~230 тикеров) "
+    "и добавляю в отдельный авто-вотчлист те, у которых недельный тренд уже подходящий — их я "
+    "тоже проверяю каждые 15 минут вместе с твоим списком. Монеты, у которых тренд перестал "
+    "подходить, сами оттуда выпадают на следующем цикле.\n\n"
     "Ордера я не выставляю и в MEXC не захожу — только анализ. Решение и покупку делаешь ты сам."
 )
 
@@ -54,6 +58,18 @@ DEFAULT_WATCHLIST = [
 ]
 CHAT_ID_FILE = "chat_id.txt"
 WATCHLIST_FILE = "watchlist.txt"
+
+# Широкий скан всех монет (TOP_COINS + пулы A-E, ~230 тикеров) раз в 2 часа — добавлено
+# 2026-09-12 по просьбе Вадима: обычный вотчлист из 24 монет не покрывает остальные
+# тикеры из /pool a-e, сигнал по ним можно пропустить. Сканировать всё это каждые 15 минут
+# нельзя — скан последовательный (блокирующий), 230 монет займут заметное время и будут
+# тормозить ответы бота. Поэтому широкий скан — раз в 2 часа отдельным фоновым job'ом,
+# он полностью пересобирает auto_watchlist.txt (не дополняет!) по критерию "недельный
+# тренд уже подходящий" (signal_type или signal_type_breakout не WAIT) — благодаря
+# полной пересборке монеты, у которых тренд перестал быть подходящим, сами выпадают
+# на следующем цикле, без отдельной логики удаления.
+FULL_SCAN_INTERVAL_SECONDS = 2 * 60 * 60
+AUTO_WATCHLIST_FILE = "auto_watchlist.txt"
 
 # coin -> (signal_type Элдора, signal_type_breakout Гудмана) на момент последней автопроверки.
 # Нужен, чтобы алертить только на РЕАЛЬНОМ переходе в BUY, а не спамить на каждой проверке.
@@ -91,6 +107,38 @@ def _save_watchlist(coins: list[str]):
             f.write(",".join(coins))
     except Exception:
         logger.exception("Не смог сохранить вотчлист")
+
+
+def _load_auto_watchlist() -> list[str]:
+    """Авто-вотчлист, который сам пересобирает _full_scan_job. В отличие от
+    _load_watchlist(), пустой файл/его отсутствие — нормальное состояние
+    (например, до первого широкого скана после рестарта), а не повод
+    подставлять DEFAULT_WATCHLIST."""
+    try:
+        with open(AUTO_WATCHLIST_FILE) as f:
+            return [c.strip().upper() for c in f.read().split(",") if c.strip()]
+    except Exception:
+        return []
+
+
+def _save_auto_watchlist(coins: list[str]):
+    try:
+        with open(AUTO_WATCHLIST_FILE, "w") as f:
+            f.write(",".join(coins))
+    except Exception:
+        logger.exception("Не смог сохранить авто-вотчлист")
+
+
+def _combined_watchlist() -> list[str]:
+    """Ручной вотчлист (/watch) + авто-вотчлист (широкий скан раз в 2 часа), без дублей."""
+    manual = _load_watchlist()
+    seen = set(manual)
+    combined = list(manual)
+    for c in _load_auto_watchlist():
+        if c not in seen:
+            seen.add(c)
+            combined.append(c)
+    return combined
 
 def _chunk_text(text: str, limit: int = TELEGRAM_MSG_LIMIT) -> list[str]:
     """Режет длинный текст на части по границам строк, не разрывая строку пополам,
@@ -234,10 +282,14 @@ async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     watchlist = _load_watchlist()
     if not args:
+        auto = _load_auto_watchlist()
         await update.message.reply_text(
             "Вотчлист сейчас: " + (", ".join(watchlist) if watchlist else "пусто") + "\n"
-            f"Автопроверка каждые {CHECK_INTERVAL_SECONDS // 60} мин, алерт только при реальном "
-            "переходе в BUY (у любой из двух методик — Элдор или Гудман).\n\n"
+            f"Авто-вотчлист (широкий скан всех {len(all_pool_coins())} монет раз в "
+            f"{FULL_SCAN_INTERVAL_SECONDS // 3600} ч, недельный тренд уже подходящий): "
+            + (f"{len(auto)} монет — {', '.join(auto)}" if auto else "пока пусто") + "\n"
+            f"Автопроверка обоих списков вместе каждые {CHECK_INTERVAL_SECONDS // 60} мин, алерт только при "
+            "реальном переходе в BUY (у любой из двух методик — Элдор или Гудман).\n\n"
             "Использование: /watch МОНЕТА [МОНЕТА2 ...] — добавить в вотчлист"
         )
         return
@@ -284,7 +336,7 @@ async def _watch_job(context: ContextTypes.DEFAULT_TYPE):
     if not chat_id:
         return  # ещё ни разу не писал боту после рестарта — некому слать
 
-    results, errors = scan_coins(_load_watchlist())
+    results, errors = scan_coins(_combined_watchlist())
     if errors:
         logger.warning("Автопроверка вотчлиста: не удалось получить данные по %s", ", ".join(c for c, _ in errors))
 
@@ -316,6 +368,45 @@ async def _watch_job(context: ContextTypes.DEFAULT_TYPE):
             )
 
 
+async def _full_scan_job(context: ContextTypes.DEFAULT_TYPE):
+    """Раз в 2 часа сканирует ВСЕ монеты (TOP_COINS + пулы A-E, без дублей — см.
+    all_pool_coins()) и полностью пересобирает auto_watchlist.txt: в него попадают
+    монеты, у которых недельный тренд (Screen 1) уже подходящий хотя бы по одной
+    из двух методик (signal_type != WAIT или signal_type_breakout != WAIT) — то
+    есть кандидаты, которых имеет смысл проверять каждые 15 минут на точку входа.
+
+    Список каждый раз строится заново (не дополняется), поэтому монеты, у которых
+    тренд перестал быть подходящим, сами выпадают на следующем цикле — отдельной
+    логики удаления не нужно. Сам алерт на BUY по-прежнему шлёт только _watch_job."""
+    coins = all_pool_coins()
+    results, errors = scan_coins(coins)
+    if errors:
+        logger.warning("Широкий скан (авто-вотчлист): не удалось получить данные по %s",
+                        ", ".join(c for c, _ in errors))
+
+    candidates = sorted({
+        d["coin"] for d in results
+        if d["signal_type"] != "WAIT" or d["signal_type_breakout"] != "WAIT"
+    })
+
+    prev_auto = set(_load_auto_watchlist())
+    _save_auto_watchlist(candidates)
+
+    chat_id = _load_chat_id()
+    if chat_id:
+        added = sorted(set(candidates) - prev_auto)
+        removed = sorted(prev_auto - set(candidates))
+        if added or removed:
+            text = (
+                f"🔎 Широкий скан ({len(coins)} монет): в авто-вотчлисте теперь {len(candidates)}.\n"
+            )
+            if added:
+                text += f"Добавлены (тренд стал подходящим): {', '.join(added)}\n"
+            if removed:
+                text += f"Убраны (тренд больше не подходящий): {', '.join(removed)}"
+            await context.bot.send_message(chat_id=chat_id, text=text.strip())
+
+
 def main():
     if not TOKEN:
         raise RuntimeError("Не найден TELEGRAM_BOT_TOKEN в переменных окружения")
@@ -332,6 +423,7 @@ def main():
     app.add_handler(MessageHandler(filters.ALL, _capture_chat_id), group=1)
 
     app.job_queue.run_repeating(_watch_job, interval=CHECK_INTERVAL_SECONDS, first=60)
+    app.job_queue.run_repeating(_full_scan_job, interval=FULL_SCAN_INTERVAL_SECONDS, first=300)
 
     logger.info("Бот запущен")
     app.run_polling()
