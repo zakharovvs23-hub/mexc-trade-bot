@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from datetime import datetime, timezone, timedelta, time as dt_time
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
@@ -74,6 +75,24 @@ AUTO_WATCHLIST_FILE = "auto_watchlist.txt"
 # coin -> (signal_type Элдора, signal_type_breakout Гудмана) на момент последней автопроверки.
 # Нужен, чтобы алертить только на РЕАЛЬНОМ переходе в BUY, а не спамить на каждой проверке.
 _last_signal_state: dict[str, tuple[str, str]] = {}
+
+# Время последнего УСПЕШНОГО прогона _watch_job / _full_scan_job (UTC, в памяти процесса —
+# сбрасывается при рестарте бота, это нормально: пустое значение после рестарта — честный
+# признак "ещё не проверял", а не ошибка). Нужно для heartbeat-отчёта (см. ниже) — 2026-09-12,
+# по просьбе Вадима: "чтобы не получилось, что сигнала ждём, а бот в итоге не работал".
+_last_watch_run: datetime | None = None
+_last_full_scan_run: datetime | None = None
+
+# Новороссийск — UTC+3 круглый год (без перехода на летнее время).
+_NVRSK_TZ = timezone(timedelta(hours=3))
+
+# Три отчёта в день по местному времени Вадима (Новороссийск, UTC+3) — храним как UTC-время,
+# т.к. большинство хостингов (Railway и т.п.) крутят процесс в UTC независимо от таймзоны сервера.
+HEARTBEAT_TIMES_UTC = [
+    dt_time(hour=6, minute=5, tzinfo=timezone.utc),   # 09:05 по Новороссийску
+    dt_time(hour=11, minute=5, tzinfo=timezone.utc),  # 14:05 по Новороссийску
+    dt_time(hour=17, minute=5, tzinfo=timezone.utc),  # 20:05 по Новороссийску
+]
 
 
 def _load_chat_id():
@@ -332,6 +351,7 @@ async def _watch_job(context: ContextTypes.DEFAULT_TYPE):
     Использует ту же scan_coins(), что и /scan и /pool — проверенный пулом путь, а не отдельный
     цикл analyze_raw() по монете: одинаковая нагрузка на MEXC API что при ручном /scan 24, что
     при автопроверке, только теперь она идёт каждые 15 минут сама, без участия Вадима."""
+    global _last_watch_run
     chat_id = _load_chat_id()
     if not chat_id:
         return  # ещё ни разу не писал боту после рестарта — некому слать
@@ -339,6 +359,7 @@ async def _watch_job(context: ContextTypes.DEFAULT_TYPE):
     results, errors = scan_coins(_combined_watchlist())
     if errors:
         logger.warning("Автопроверка вотчлиста: не удалось получить данные по %s", ", ".join(c for c, _ in errors))
+    _last_watch_run = datetime.now(timezone.utc)
 
     for d in results:
         coin = d["coin"]
@@ -378,6 +399,7 @@ async def _full_scan_job(context: ContextTypes.DEFAULT_TYPE):
     Список каждый раз строится заново (не дополняется), поэтому монеты, у которых
     тренд перестал быть подходящим, сами выпадают на следующем цикле — отдельной
     логики удаления не нужно. Сам алерт на BUY по-прежнему шлёт только _watch_job."""
+    global _last_full_scan_run
     coins = all_pool_coins()
     results, errors = scan_coins(coins)
     if errors:
@@ -391,6 +413,7 @@ async def _full_scan_job(context: ContextTypes.DEFAULT_TYPE):
 
     prev_auto = set(_load_auto_watchlist())
     _save_auto_watchlist(candidates)
+    _last_full_scan_run = datetime.now(timezone.utc)
 
     chat_id = _load_chat_id()
     if chat_id:
@@ -405,6 +428,54 @@ async def _full_scan_job(context: ContextTypes.DEFAULT_TYPE):
             if removed:
                 text += f"Убраны (тренд больше не подходящий): {', '.join(removed)}"
             await context.bot.send_message(chat_id=chat_id, text=text.strip())
+
+
+def _format_ago(moment: datetime | None) -> str:
+    """'12 мин назад' / 'ни разу с рестарта' — для heartbeat-отчёта."""
+    if moment is None:
+        return "ни разу с последнего рестарта бота"
+    minutes = int((datetime.now(timezone.utc) - moment).total_seconds() // 60)
+    if minutes < 1:
+        return "меньше минуты назад"
+    if minutes < 60:
+        return f"{minutes} мин назад"
+    hours = minutes // 60
+    return f"{hours} ч {minutes % 60} мин назад"
+
+
+async def _heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
+    """Отчёт 'бот жив' 3 раза в день (09:05 / 14:05 / 20:05 по Новороссийску) — добавлено
+    2026-09-12 по просьбе Вадима: "чтобы не получилось, что сигнала ждём, а бот в итоге
+    не работал". Не делает новый скан сам — только показывает состояние уже идущих
+    фоновых job'ов (_watch_job каждые 15 мин, _full_scan_job раз в 2 часа), поэтому не
+    создаёт дополнительной нагрузки на MEXC API."""
+    chat_id = _load_chat_id()
+    if not chat_id:
+        return
+
+    watch_age_min = None if _last_watch_run is None else (datetime.now(timezone.utc) - _last_watch_run).total_seconds() / 60
+    stale_warning = ""
+    if watch_age_min is not None and watch_age_min > CHECK_INTERVAL_SECONDS / 60 + 10:
+        stale_warning = (
+            f"\n⚠️ Последняя проверка вотчлиста была {_format_ago(_last_watch_run)} — "
+            f"дольше обычного (норма — каждые {CHECK_INTERVAL_SECONDS // 60} мин). "
+            "Возможно, бот перезапустился или завис — стоит проверить."
+        )
+
+    buy_count = sum(1 for (e, b) in _last_signal_state.values() if e == "BUY" or b == "BUY")
+    watch_count = sum(1 for (e, b) in _last_signal_state.values() if e == "WATCH" or b == "WATCH")
+
+    now_local = datetime.now(timezone.utc).astimezone(_NVRSK_TZ)
+    text = (
+        f"✅ Бот на связи, {now_local.strftime('%d.%m %H:%M')} (Новороссийск).\n"
+        f"Ручной вотчлист: {len(_load_watchlist())} монет. "
+        f"Авто-вотчлист: {len(_load_auto_watchlist())} монет.\n"
+        f"Последняя проверка вотчлиста (15 мин): {_format_ago(_last_watch_run)}.\n"
+        f"Последний широкий скан (2 ч): {_format_ago(_last_full_scan_run)}.\n"
+        f"Сейчас отслеживается {len(_last_signal_state)} монет, из них BUY: {buy_count}, WATCH: {watch_count}."
+        f"{stale_warning}"
+    )
+    await context.bot.send_message(chat_id=chat_id, text=text)
 
 
 def main():
@@ -424,6 +495,8 @@ def main():
 
     app.job_queue.run_repeating(_watch_job, interval=CHECK_INTERVAL_SECONDS, first=60)
     app.job_queue.run_repeating(_full_scan_job, interval=FULL_SCAN_INTERVAL_SECONDS, first=300)
+    for t in HEARTBEAT_TIMES_UTC:
+        app.job_queue.run_daily(_heartbeat_job, time=t)
 
     logger.info("Бот запущен")
     app.run_polling()
