@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -206,7 +207,12 @@ async def handle_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.chat.send_action("typing")
     try:
-        result = analyze(coin)
+        # asyncio.to_thread (2026-09-13): analyze() делает несколько блокирующих HTTP-запросов
+        # (requests, не aiohttp) — без выноса в отдельный поток такой вызов прямо внутри async
+        # хэндлера замораживал бы ВЕСЬ бот (единый event loop) на всё время запроса, включая
+        # обработку сообщений от других команд и фоновые job'ы. См. подробный комментарий у
+        # scan() ниже — там та же причина обнаружена по жалобе Вадима "бот не отвечает".
+        result = await asyncio.to_thread(analyze, coin)
         await update.message.reply_text(result)
     except Exception as e:
         logger.exception("Ошибка анализа")
@@ -230,7 +236,14 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action("typing")
     await update.message.reply_text(f"Сканирую {len(coins)} монет пулом, подожди немного...")
     try:
-        results, errors = scan_coins(coins)
+        # asyncio.to_thread (2026-09-13, по жалобе Вадима "бот не отвечает"): scan_coins()
+        # внутри дергает requests.get (синхронный, блокирующий HTTP) на каждую монету —
+        # 3-4 запроса на монету, до 10 сек таймаут на каждый. Вызванный напрямую внутри async
+        # хэндлера, он выполняется на ЕДИНСТВЕННОМ event loop бота и блокирует АБСОЛЮТНО ВСЁ
+        # (ответы на другие команды, фоновые _watch_job/_full_scan_job) на всё время скана —
+        # для 24+ монет это реально могло ощущаться как "бот завис". asyncio.to_thread уводит
+        # блокирующий вызов в отдельный поток, event loop остаётся свободным.
+        results, errors = await asyncio.to_thread(scan_coins, coins)
         await _reply_chunked(update, format_scan_result(results, errors))
     except Exception as e:
         logger.exception("Ошибка сканирования")
@@ -253,7 +266,7 @@ async def pool_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.chat.send_action("typing")
             await update.message.reply_text(f"Сканирую пул {pool_key.upper()} ({len(coins)} монет)...")
             try:
-                results, errors = scan_coins(coins)
+                results, errors = await asyncio.to_thread(scan_coins, coins)
                 await _reply_chunked(update, format_scan_result(results, errors, title=f"Пул {pool_key.upper()}"))
             except Exception as e:
                 logger.exception("Ошибка сканирования пула %s", pool_key)
@@ -270,7 +283,7 @@ async def pool_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action("typing")
     await update.message.reply_text(f"Сканирую пул {key.upper()} ({len(coins)} монет)...")
     try:
-        results, errors = scan_coins(coins)
+        results, errors = await asyncio.to_thread(scan_coins, coins)
         await _reply_chunked(update, format_scan_result(results, errors, title=f"Пул {key.upper()}"))
     except Exception as e:
         logger.exception("Ошибка сканирования")
@@ -302,7 +315,7 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     label = "быстрой методике" if methodology == "fast" else "строгой методике"
     await update.message.reply_text(f"Считаю бэктест по {coin.upper()} за ~год ({label}), подожди немного...")
     try:
-        result = backtest(coin, tp_pct=tp_pct, sl_pct=sl_pct, methodology=methodology)
+        result = await asyncio.to_thread(backtest, coin, tp_pct=tp_pct, sl_pct=sl_pct, methodology=methodology)
         await update.message.reply_text(format_backtest(result))
     except Exception as e:
         logger.exception("Ошибка бэктеста")
@@ -361,13 +374,20 @@ async def _watch_job(context: ContextTypes.DEFAULT_TYPE):
 
     Использует ту же scan_coins(), что и /scan и /pool — проверенный пулом путь, а не отдельный
     цикл analyze_raw() по монете: одинаковая нагрузка на MEXC API что при ручном /scan 24, что
-    при автопроверке, только теперь она идёт каждые 15 минут сама, без участия Вадима."""
+    при автопроверке, только теперь она идёт каждые 15 минут сама, без участия Вадима.
+
+    asyncio.to_thread (2026-09-13): с добавлением авто-вотчлиста (2026-09-12) этот job может
+    сканировать до ~230 монет за раз (24 ручных + до ~207 авто), а не 24 как раньше. Без выноса
+    в отдельный поток синхронный scan_coins() блокировал бы единственный event loop бота на всё
+    время скана — весь бот (включая ответы на /scan, /backtest и т.д.) был бы недоступен, пока
+    не досканирует все монеты. Обнаружено по жалобе Вадима "бот не отвечает" на /scan 24 монет —
+    тот же самый паттерн блокировки, только здесь ещё и раз в 15 минут на бОльшем списке."""
     global _last_watch_run
     chat_id = _load_chat_id()
     if not chat_id:
         return  # ещё ни разу не писал боту после рестарта — некому слать
 
-    results, errors = scan_coins(_combined_watchlist())
+    results, errors = await asyncio.to_thread(scan_coins, _combined_watchlist())
     if errors:
         logger.warning("Автопроверка вотчлиста: не удалось получить данные по %s", ", ".join(c for c, _ in errors))
     _last_watch_run = datetime.now(timezone.utc)
@@ -423,10 +443,14 @@ async def _full_scan_job(context: ContextTypes.DEFAULT_TYPE):
 
     Список каждый раз строится заново (не дополняется), поэтому монеты, у которых
     тренд перестал быть подходящим, сами выпадают на следующем цикле — отдельной
-    логики удаления не нужно. Сам алерт на BUY по-прежнему шлёт только _watch_job."""
+    логики удаления не нужно. Сам алерт на BUY по-прежнему шлёт только _watch_job.
+
+    asyncio.to_thread (2026-09-13, см. _watch_job) — этот job сканирует ~207 монет
+    за раз, самый долгий синхронный вызов в боте; без выноса в отдельный поток он
+    держал бы event loop бота занятым дольше всех остальных job'ов вместе взятых."""
     global _last_full_scan_run
     coins = all_pool_coins()
-    results, errors = scan_coins(coins)
+    results, errors = await asyncio.to_thread(scan_coins, coins)
     if errors:
         logger.warning("Широкий скан (авто-вотчлист): не удалось получить данные по %s",
                         ", ".join(c for c, _ in errors))
