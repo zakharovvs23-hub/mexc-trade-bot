@@ -398,7 +398,8 @@ def format_analysis(d: dict) -> str:
 
     lines.append("")
     if d["signal_type_fast"] == "BUY":
-        lines.append("💡 СИГНАЛ (быстрый Screen 1, MA5/13/20, ЭКСПЕРИМЕНТ): Buy — для сравнения, не для реальных сделок пока")
+        lines.append("💡 СИГНАЛ (быстрый Screen 1, MA5/13/20, ЭКСПЕРИМЕНТ): Buy — статистики по этой методике "
+                      "пока меньше, чем по двум другим (см. /backtest МОНЕТА fast), решение по объёму делай сам")
     elif d["signal_type_fast"] == "WATCH":
         lines.append("💡 СИГНАЛ (быстрый Screen 1, MA5/13/20, ЭКСПЕРИМЕНТ): Следить")
     else:
