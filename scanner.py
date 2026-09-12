@@ -52,6 +52,22 @@ POOLS = {
 }
 
 
+def all_pool_coins() -> list[str]:
+    """
+    Полный список уникальных тикеров: TOP_COINS + все пулы A-E (без дублей,
+    порядок первого появления сохранён). Используется фоновым 2-часовым
+    широким сканом (авто-вотчлист, добавлено 2026-09-12) — в отличие от
+    ручных /scan и /pool, где пользователь сам выбирает, что сканировать.
+    """
+    seen: set[str] = set()
+    combined: list[str] = []
+    for coin in TOP_COINS + [c for pool in POOLS.values() for c in pool]:
+        if coin not in seen:
+            seen.add(coin)
+            combined.append(coin)
+    return combined
+
+
 def scan_coins(coins: list[str]) -> tuple[list[dict], list[tuple[str, str]]]:
     """
     Прогоняет analyze_raw (Elder's Triple Screen + методика Гудмана) по списку монет
