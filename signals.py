@@ -144,7 +144,29 @@ def analyze_raw(coin: str) -> dict:
     df_w = pd.DataFrame(weekly)
     df_d = pd.DataFrame(daily)
 
-    weekly_macd = calc_macd(df_w["close"])
+    # Screen 1 (недельный тренд) считаем только по ЗАКРЫТЫМ неделям (2026-09-22).
+    # MEXC отдаёт последней свечой ЕЩЁ ФОРМИРУЮЩУЮСЯ текущую неделю — её close это
+    # фактически текущая цена. Раньше MA5/10/13/20/30/60 и недельный MACD считались
+    # ПРЯМО НА НЕЙ, поэтому структура тренда (Бычий/Боковик) и наклон MACD-гистограммы
+    # дёргались туда-сюда при обычном внутридневном движении цены — реальная неделя
+    # при этом ещё даже не закрывалась. Живой кейс: JST дал BUY по всем методикам,
+    # а через ~2 часа Screen 1 (и у Элдора/Гудмана, и у быстрой MA5/13/20) перестал
+    # быть бычьим просто от отката цены на 2.3% внутри дня. Теперь уровни MA и MACD
+    # считаются по последней ЗАКРЫТОЙ неделе — обновляются раз в неделю, а не каждые
+    # 15 минут; текущая живая цена по-прежнему сравнивается с ними (bull_order),
+    # так что вход всё ещё реагирует на движение цены, просто сама структура тренда
+    # больше не "дышит" из-за недельной свечи, которая ещё не закрылась.
+    df_w_closed = df_w.iloc[:-1] if len(df_w) > 1 else df_w
+    # Порядок MA (price > MA10 > MA30 > MA60) тоже сравниваем с последним ЗАКРЫТЫМ
+    # недельным закрытием, а не с текущей живой ценой — иначе Screen 1 всё равно
+    # мигал бы туда-сюда каждый раз, когда цена внутри недели ненадолго ныряет под
+    # одну из MA. Элдор описывает Screen 1 как "прилив": недельная оценка тренда
+    # задаёт стратегическое смещение на всю неделю и не пересматривается каждый
+    # день — тактический, живой уровень остаётся за Screen 2/3 ниже, которые
+    # по-прежнему используют текущую цену.
+    weekly_close_price = float(df_w_closed["close"].iloc[-1]) if len(df_w_closed) else price
+
+    weekly_macd = calc_macd(df_w_closed["close"])
     daily_macd = calc_macd(df_d["close"])
     daily_rsi = calc_rsi(df_d["close"])
     volume_note = calc_volume_signal(df_d["volume"])
@@ -155,8 +177,8 @@ def analyze_raw(coin: str) -> dict:
     intraday_change_pct = calc_intraday_change(df_d, price)
     fg_value, fg_class = get_fear_greed()
     fg_note = fear_greed_note(fg_value, fg_class)
-    ma_trend = calc_weekly_ma_trend(df_w["close"], price)
-    ma_trend_fast = calc_weekly_ma_trend_fast(df_w["close"], price)
+    ma_trend = calc_weekly_ma_trend(df_w_closed["close"], weekly_close_price)
+    ma_trend_fast = calc_weekly_ma_trend_fast(df_w_closed["close"], weekly_close_price)
 
     weekly_trend_text = "вверх" if weekly_macd["trend_up"] else "вниз"
 
