@@ -1,12 +1,10 @@
 import pandas as pd
 
-from indicators import calc_rsi, calc_macd, calc_volume_signal, calc_elder_ray, calc_breakout_signal, calc_intraday_change
+from indicators import calc_rsi, calc_macd, calc_volume_signal, calc_elder_ray, calc_intraday_change
 from mexc_api import get_klines, get_current_price
 from fear_greed import get_fear_greed, fear_greed_note
 
 FLAT_MA_THRESHOLD_PCT = 1.0  # изменение MA60 за 6 недель, ниже которого тренд считается плоским
-BREAKOUT_VOLUME_THRESHOLD_PCT = 120.0  # объём должен быть >=120% среднего, чтобы пробой засчитался
-BREAKOUT_MAX_CHASE_PCT = 5.0  # не гнаться, если цена ушла дальше 5% от уровня пробоя
 def calc_weekly_ma_trend(weekly_close: pd.Series, price: float) -> dict:
     """
     Screen 1 (недельный, Elder's Triple Screen) — классифицирует тренд по MA10/MA30/MA60.
@@ -132,11 +130,13 @@ def analyze_raw(coin: str) -> dict:
     Используется и для одиночного анализа (analyze), и для
     массового сканирования пулом (scanner.py).
 
-    Две независимые методики входа, обе используют общий Screen 1 (недельный тренд):
-    - signal_type — методика Элдора (откат Bear Power внутри уже бычьей структуры).
-    - signal_type_breakout — методика Гудмана (пробой 20-дневного максимума
-      закрытия с подтверждением объёмом и подтверждением на следующий день,
-      без погони за уже ушедшей ценой).
+    Основная методика (signal_type) — Элдора (откат Bear Power внутри уже бычьей
+    структуры). Параллельно считается экспериментальная быстрая версия того же
+    Screen 1 (signal_type_fast, MA5/13/20 вместо MA10/30/60).
+
+    2026-09-24: методика Гудмана (пробой 20-дневного максимума закрытия) убрана
+    из бота — по реальной статистике сделок из торгового журнала она дала 0%
+    win-rate. См. ways-of-working.md за подробностями бэктеста.
     """
     price = get_current_price(coin)
     weekly = get_klines(coin, "1w", limit=110)
@@ -173,7 +173,6 @@ def analyze_raw(coin: str) -> dict:
     volume_ratio_pct = calc_volume_ratio(df_d)
     sr_levels = find_support_resistance(df_d, price)
     elder = calc_elder_ray(df_d)
-    breakout = calc_breakout_signal(df_d)
     intraday_change_pct = calc_intraday_change(df_d, price)
     fg_value, fg_class = get_fear_greed()
     fg_note = fear_greed_note(fg_value, fg_class)
@@ -243,34 +242,6 @@ def analyze_raw(coin: str) -> dict:
         signal_type_fast = "WAIT"
         reasoning_fast.append("Недельный тренд (быстрый) — боковик/переходный")
 
-    breakout_reasoning = []
-    if tier_a:
-        volume_ok = breakout["breakout_day_volume_pct"] is not None and breakout["breakout_day_volume_pct"] >= BREAKOUT_VOLUME_THRESHOLD_PCT
-        if breakout["breakout_confirmed"] and volume_ok:
-            if breakout["dist_from_breakout_pct"] is not None and breakout["dist_from_breakout_pct"] <= BREAKOUT_MAX_CHASE_PCT:
-                signal_type_breakout = "BUY"
-                breakout_reasoning.append(
-                    f"Пробой 20-дневного максимума закрытия ({breakout['range_high']}) подтверждён на следующий день "
-                    f"(цена удержалась выше уровня), объём на свече пробоя {breakout['breakout_day_volume_pct']}% от среднего."
-                )
-            else:
-                signal_type_breakout = "WATCH"
-                breakout_reasoning.append(
-                    f"Пробой подтверждён ({breakout['range_high']}), но цена уже ушла на "
-                    f"{breakout['dist_from_breakout_pct']}% — не гонимся, ждём следующей консолидации."
-                )
-        elif breakout["breakout"] and not breakout["breakout_confirmed"]:
-            signal_type_breakout = "WATCH"
-            breakout_reasoning.append(
-                f"Пробой {breakout['range_high']} произошёл на последней свече — ждём, удержится ли цена "
-                "выше на следующий день, прежде чем считать его подтверждённым (защита от ложного пробоя на объёме)."
-            )
-        else:
-            signal_type_breakout = "WATCH"
-            breakout_reasoning.append("Screen 1 бычий, но пробоя диапазона ещё не было — в поле зрения.")
-    else:
-        signal_type_breakout = "WAIT"
-        breakout_reasoning.append("Недельный тренд не бычий — пробойную методику не рассматриваем.")
     if signal_type in ("BUY", "WATCH") and daily_rsi > 70:
         reasoning.append(f"⚠️ RSI {daily_rsi} — перекуплен, возможна дивергенция, проверь дневной график глазами")
 
@@ -305,7 +276,6 @@ def analyze_raw(coin: str) -> dict:
         "volume_ratio_pct": volume_ratio_pct,
         "sr_levels": sr_levels,
         "elder": elder,
-        "breakout": breakout,
         "intraday_change_pct": intraday_change_pct,
         "fg_value": fg_value,
         "fg_note": fg_note,
@@ -315,11 +285,9 @@ def analyze_raw(coin: str) -> dict:
         "ma_trend_fast": ma_trend_fast,
         "tier_a": tier_a,
         "signal_type": signal_type,
-        "signal_type_breakout": signal_type_breakout,
         "signal_type_fast": signal_type_fast,
         "needs_review": needs_review,
         "reasoning": reasoning,
-        "breakout_reasoning": breakout_reasoning,
         "reasoning_fast": reasoning_fast,
         "score": round(score, 2),
     }
@@ -399,24 +367,6 @@ def format_analysis(d: dict) -> str:
     lines.append("Обоснование: " + "; ".join(d["reasoning"]))
     if d["fg_warning"]:
         lines.append(d["fg_warning"])
-    lines.append("")
-    if d["signal_type_breakout"] == "BUY":
-        bo = d["breakout"]
-        entry_bo = round(d["price"], 6)
-        sl_bo = round(bo["range_high"] * 0.99, 6) if bo["range_high"] else round(entry_bo * 0.94, 6)
-        risk_bo = entry_bo - sl_bo
-        tp_bo = round(entry_bo + 2 * risk_bo, 6)
-        lines.append("💡 СИГНАЛ (методика Гудмана, пробой): Buy")
-        lines.append(f"Вход: {entry_bo}")
-        lines.append(f"Stop-Loss: {sl_bo} (чуть ниже линии пробоя {bo['range_high']})")
-        lines.append(f"Take-Profit (ориентир для журнала): {tp_bo}")
-        lines.append("R/R: 1:2 (справочно — правильный выход по этой методике должен быть по трейлинг-стопу, "
-                      "а не по фиксированной цели; трейлинг-стоп в боте пока не реализован)")
-    elif d["signal_type_breakout"] == "WATCH":
-        lines.append("💡 СИГНАЛ (методика Гудмана, пробой): Следить (структура бычья, пробоя ещё нет или он не устоялся)")
-    else:
-        lines.append("💡 СИГНАЛ (методика Гудмана, пробой): Ждать")
-    lines.append("Обоснование: " + "; ".join(d["breakout_reasoning"]))
 
     lines.append("")
     if d["signal_type_fast"] == "BUY":
