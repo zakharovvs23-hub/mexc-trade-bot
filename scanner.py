@@ -16,6 +16,24 @@ TOP_COINS = [
     "AXS", "KAVA", "CHZ", "1INCH", "ZEC", "COMP", "SNX", "CRV", "ENJ", "GALA",
 ]
 
+# Критерии отбора монет для пулов ротации (эвристика от 2026-09-24, выведена из
+# сравнения /backtest по топ-10 монет по капитализации против волатильных альтов,
+# которыми Вадим реально торгует по журналу сделок — см. ways-of-working.md за
+# полным разбором цифр):
+#
+# 1. Средний/малый эшелон по капитализации, а НЕ топ-10 — на топ-10 (BTC, ETH,
+#    BNB, SOL, XRP, DOGE, ADA, TRX, AVAX, LINK) строгая методика почти не даёт
+#    сигналов, а быстрая — редкие и на маленькой выборке.
+# 2. Устойчивый нарратив, двигающий монету весь последний год (приватность —
+#    XMR/ZEC, перп-DEX/DeFi — HYPE/AERO, AI — VVV, TRON-экосистема — JST и т.п.),
+#    а не монета без явного катализатора, застрявшая в консолидации/даунтренде.
+# 3. Относительно невысокая абсолютная цена / высокая % волатильность — так
+#    проще пробить TP в 6% за разумное время удержания.
+#
+# Это рабочая гипотеза по итогам одного раунда бэктестов, не железное правило —
+# пересматривать по мере новых данных. Практическое следствие: монеты, месяцами
+# не дающие сигналов ни по одной методике (в этом раунде — APT, SUI, FIL, TIA) —
+# кандидаты на временное исключение из пулов, а не обязательный список на удаление.
 POOLS = {
     "a": [
         "C98", "SKL", "WOO", "DODO", "STORJ", "TIA", "SEI", "STRK", "JUP", "PYTH",
@@ -70,9 +88,9 @@ def all_pool_coins() -> list[str]:
 
 def scan_coins(coins: list[str]) -> tuple[list[dict], list[tuple[str, str]]]:
     """
-    Прогоняет analyze_raw (Elder's Triple Screen + методика Гудмана) по списку монет
-    и сортирует результаты по score. Монеты, по которым не удалось получить данные,
-    попадают в errors, а не прерывают сканирование остальных.
+    Прогоняет analyze_raw (Elder's Triple Screen, строгая + быстрая методики) по
+    списку монет и сортирует результаты по score. Монеты, по которым не удалось
+    получить данные, попадают в errors, а не прерывают сканирование остальных.
     """
     results = []
     errors = []
@@ -91,30 +109,28 @@ _SIGNAL_EMOJI = {"BUY": "🟢", "WATCH": "🟡", "WAIT": "⚪️"}
 
 def format_scan_result(results: list[dict], errors: list[tuple], title: str | None = None) -> str:
     """
-    Пулом выводит по каждой монете два сигнала (Элдор/Гудман), цену, недельный тренд,
-    Elder-ray, RSI и score, плюс отдельным полем — экспериментальный быстрый Screen 1
-    (MA5/13/20, добавлен 2026-09-08), чтобы было видно расхождение со строгим Screen 1
-    прямо в общем скане, а не только в /analyze по одной монете.
-    """
+    Пулом выводит по каждой монете сигналы по строгой методике Элдора, цену,
+    недельный тренд, Elder-ray, RSI и score, плюс отдельным полем — экспериментальный
+    быстрый Screen 1 (MA5/13/20, добавлен 2026-09-08), чтобы было видно расхождение
+    со строгим Ссамения от 12Папр 15/13/20, ഋ иѡмоет этнеменияальр
+   """
     if not results and not errors:
         return "Нет данных для отображения."
 
     buy_count = sum(1 for d in results if d["signal_type"] == "BUY")
     watch_count = sum(1 for d in results if d["signal_type"] == "WATCH")
-    buy_count_bo = sum(1 for d in results if d["signal_type_breakout"] == "BUY")
     buy_count_fast = sum(1 for d in results if d["signal_type_fast"] == "BUY")
 
     header = title or f"Результаты сканирования ({len(results)} монет)"
 
     lines = [
         f"📊 {header}, от сильных к слабым: 🟢 BUY(Элдор) {buy_count} | 🟡 WATCH(Элдор) {watch_count} "
-        f"| 🟢 BUY(Гудман) {buy_count_bo} | 🔵 BUY(Быстрый, эксп.) {buy_count_fast}",
+        f"| 🔵 BUY(Быстрый, эксп.) {buy_count_fast}",
         "",
     ]
 
     for i, d in enumerate(results, start=1):
         emoji = _SIGNAL_EMOJI.get(d["signal_type"], "⚪️")
-        emoji_bo = _SIGNAL_EMOJI.get(d["signal_type_breakout"], "⚪️")
         emoji_fast = _SIGNAL_EMOJI.get(d["signal_type_fast"], "⚪️")
         e = d["elder"]
 
@@ -128,7 +144,7 @@ def format_scan_result(results: list[dict], errors: list[tuple], title: str | No
             fast_bit = f" | Быстрый {emoji_fast}{d['signal_type_fast']}"
 
         lines.append(
-            f"{i}. {emoji}Элдор/{emoji_bo}Гудман {d['coin']} — {d['signal_type']}/{d['signal_type_breakout']} "
+            f"{i}. {emoji}{d['coin']} — {d['signal_type']} "
             f"| цена {d['price']} | недельный {d['ma_trend']['trend']} | RSI {d['daily_rsi']}"
             f"{elder_bit}{fast_bit} | score {d['score']:.1f}"
         )
