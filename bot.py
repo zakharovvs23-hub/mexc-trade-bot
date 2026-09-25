@@ -35,14 +35,15 @@ WELCOME = (
     "/pool all — просканировать все пулы A-E подряд (199 тикеров, займёт время)\n"
     "/backtest BTC — прогнать стратегию по BTC за ~год (строгая методика)\n"
     "/backtest BTC tp=0.08 sl=0.04 — то же со своими Take-Profit/Stop-Loss\n"
-    "/backtest BTC fast — то же, но по быстрой эксперим. методике (MA5/13/20)\n"
+    "/backtest BTC fast — то же, но по быстрой методике (MA5/13/20)\n"
+    "/backtest BTC early — то же, но по эксперим. методике \"ранний вход\" (Bear Power у нуля)\n"
     "/watch — показать вотчлист автопроверки\n"
     "/watch XMR VVV — добавить монеты в вотчлист автопроверки\n"
     "/unwatch XMR — убрать монету из вотчлиста\n\n"
     "По умолчанию в вотчлисте твой обычный список из 24 монет (тот же, что в регулярных /scan) — "
     "я проверяю его сам в фоне каждые 15 минут и пишу тебе сразу, как только по любой из монет "
-    "появится реальный сигнал BUY — по методике Элдора или быстрой (MA5/13/20) — "
-    "не нужно самому сидеть и сканировать.\n\n"
+    "появится реальный сигнал BUY — по любой из трёх методик (Элдора, быстрой MA5/13/20 или "
+    "экспериментального раннего входа) — не нужно самому сидеть и сканировать.\n\n"
     "Плюс раз в 2 часа я сам сканирую вообще все монеты (TOP_COINS + пулы A-E, ~230 тикеров) "
     "и добавляю в отдельный авто-вотчлист те, у которых недельный тренд уже подходящий — их я "
     "тоже проверяю каждые 15 минут вместе с твоим списком. Монеты, у которых тренд перестал "
@@ -75,13 +76,15 @@ WATCHLIST_FILE = "watchlist.txt"
 FULL_SCAN_INTERVAL_SECONDS = 2 * 60 * 60
 AUTO_WATCHLIST_FILE = "auto_watchlist.txt"
 
-# coin -> (signal_type Элдора, signal_type_fast Быстрой методики)
+# coin -> (signal_type Элдора, signal_type_fast Быстрой, signal_type_early Раннего входа)
 # на момент последней автопроверки. Нужен, чтобы алертить только на РЕАЛЬНОМ переходе в BUY,
 # а не спамить на каждой проверке. Быстрая методика добавлена в кортеж 2026-09-12 — Вадим
 # по итогам бэктеста (13 сделок, ~69% win-rate на трёх монетах, сравнимо со строгой методикой)
-# решил работать по обеим методикам. Методика Гудмана (пробой) убрана из бота 2026-09-24 —
-# по статистике реальных сделок из журнала у неё 0% win-rate.
-_last_signal_state: dict[str, tuple[str, str]] = {}
+# решил работать по обеим методикам, а с 2026-09-25 она полноценная, не эксперимент. Методика
+# Гудмана (пробой) убрана из бота 2026-09-24 — по статистике реальных сделок из журнала у неё
+# 0% win-rate. Ранний вход добавлен в кортеж 2026-09-25 (эксперимент, см. signals.py) — по
+# бэктесту на 10 альтах (24 сделки, 66.7% win-rate, +67%) сопоставим с быстрой методикой.
+_last_signal_state: dict[str, tuple[str, str, str]] = {}
 
 # Время последнего УСПЕШНОГО прогона _watch_job / _full_scan_job (UTC, в памяти процесса —
 # сбрасывается при рестарте бота, это нормально: пустое значение после рестарта — честный
@@ -295,7 +298,7 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
         await update.message.reply_text(
-            "Использование: /backtest МОНЕТА [tp=0.06] [sl=0.03] [fast]\n"
+            "Использование: /backtest МОНЕТА [tp=0.06] [sl=0.03] [fast|early]\n"
             "Например: /backtest BTC, /backtest ETH tp=0.08 sl=0.04 или /backtest XMR fast"
         )
         return
@@ -312,8 +315,11 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             methodology = "fast"
         elif a.lower() in ("strict", "строгий", "строгая"):
             methodology = "strict"
+        elif a.lower() in ("early", "ранний", "ранняя"):
+            methodology = "early"
 
-    label = "быстрой методике" if methodology == "fast" else "строгой методике"
+    _LABELS = {"fast": "быстрой методике", "early": "методике \"ранний вход\" (эксперимент)"}
+    label = _LABELS.get(methodology, "строгой методике")
     await update.message.reply_text(f"Считаю бэктест по {coin.upper()} за ~год ({label}), подожди немного...")
     try:
         result = await asyncio.to_thread(backtest, coin, tp_pct=tp_pct, sl_pct=sl_pct, methodology=methodology)
@@ -333,7 +339,7 @@ async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{FULL_SCAN_INTERVAL_SECONDS // 3600} ч, недельный тренд уже подходящий): "
             + (f"{len(auto)} монет — {', '.join(auto)}" if auto else "пока пусто") + "\n"
             f"Автопроверка обоих списков вместе каждые {CHECK_INTERVAL_SECONDS // 60} мин, алерт только при "
-            "реальном переходе в BUY (у любой из двух методик — Элдор или Быстрая).\n\n"
+            "реальном переходе в BUY (у любой из трёх методик — Элдор, Быстрая или Ранний вход, эксперимент).\n\n"
             "Использование: /watch МОНЕТА [МОНЕТА2 ...] — добавить в вотчлист"
         )
         return
@@ -397,22 +403,23 @@ async def _watch_job(context: ContextTypes.DEFAULT_TYPE):
         coin = d["coin"]
         cur_elder = d["signal_type"]
         cur_fast = d["signal_type_fast"]
+        cur_early = d["signal_type_early"]
         prev = _last_signal_state.get(coin)
-        _last_signal_state[coin] = (cur_elder, cur_fast)
+        _last_signal_state[coin] = (cur_elder, cur_fast, cur_early)
 
         if prev is None:
             continue  # первая проверка после рестарта — просто фиксируем базу, без алерта
 
-        prev_elder, prev_fast = prev
+        prev_elder, prev_fast, prev_early = prev
         # Строим текст алерта из того же d, что дал BUY (не повторный запрос analyze(coin) —
         # см. format_analysis() в signals.py: между двумя живыми запросами цена успевала
         # откатиться, и текст алерта мог противоречить его же заголовку).
         #
-        # Две независимые проверки (не if/elif) — 2026-09-12: раньше методики были в одной
-        # if/elif цепочке, и если обе давали BUY в один и тот же цикл проверки, второй алерт
-        # терялся (elif проверялся, только если первая ветка не сработала). Поэтому каждая
-        # методика алертит независимо — за один цикл может прийти два отдельных сообщения,
-        # если обе одновременно дали BUY.
+        # Три независимые проверки (не if/elif) — 2026-09-12, расширено 2026-09-25 под третью
+        # методику: раньше методики были в одной if/elif цепочке, и если несколько давали BUY
+        # в один и тот же цикл проверки, следующий алерт терялся (elif проверялся только если
+        # предыдущая ветка не сработала). Поэтому каждая методика алертит независимо — за один
+        # цикл может прийти несколько отдельных сообщений, если они сработали одновременно.
         if cur_elder == "BUY" and prev_elder != "BUY":
             text = format_analysis(d)
             await context.bot.send_message(
@@ -423,7 +430,13 @@ async def _watch_job(context: ContextTypes.DEFAULT_TYPE):
             text = format_analysis(d)
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"🔔 Автосигнал из вотчлиста: {coin} — быстрая методика (эксперимент, MA5/13/20) дала BUY!\n\n{text}",
+                text=f"🔔 Автосигнал из вотчлиста: {coin} — быстрая методика (MA5/13/20) дала BUY!\n\n{text}",
+            )
+        if cur_early == "BUY" and prev_early != "BUY":
+            text = format_analysis(d)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"🔔 Автосигнал из вотчлиста: {coin} — ранний вход (эксперимент, Bear Power у нуля) дал BUY!\n\n{text}",
             )
 
 
@@ -504,7 +517,7 @@ async def _heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
             "Возможно, бот перезапустился или завис — стоит проверить."
         )
 
-    # Кортеж состояния — (Элдор, Быстрая) — 2026-09-12, см. _watch_job.
+    # Кортеж состояния — (Элдор, Быстрая, Ранний вход) — 2026-09-12, расширен 2026-09-25, см. _watch_job.
     buy_count = sum(1 for state in _last_signal_state.values() if "BUY" in state)
     watch_count = sum(1 for state in _last_signal_state.values() if "WATCH" in state)
 
