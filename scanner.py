@@ -88,8 +88,8 @@ def all_pool_coins() -> list[str]:
 
 def scan_coins(coins: list[str]) -> tuple[list[dict], list[tuple[str, str]]]:
     """
-    Прогоняет analyze_raw (Elder's Triple Screen, строгая + быстрая методики) по
-    списку монет и сортирует результаты по score. Монеты, по которым не удалось
+    Прогоняет analyze_raw (Elder's Triple Screen — строгая, быстрая и экспериментальная
+    "ранний вход" методики) по списку монет и сортирует результаты по score. Монеты, по которым не удалось
     получить данные, попадают в errors, а не прерывают сканирование остальных.
     """
     results = []
@@ -109,23 +109,24 @@ _SIGNAL_EMOJI = {"BUY": "🟢", "WATCH": "🟡", "WAIT": "⚪️"}
 
 def format_scan_result(results: list[dict], errors: list[tuple], title: str | None = None) -> str:
     """
-    Пулом выводит по каждой монете сигналы по строгой методике Элдора, цену,
-    недельный тренд, Elder-ray, RSI и score, плюс отдельным полем — экспериментальный
-    быстрый Screen 1 (MA5/13/20, добавлен 2026-09-08), чтобы было видно расхождение
-    со строгим Ссамения от 12Папр 15/13/20, ഋ иѡмоет этнеменияальр
-   """
+    Пулом выводит по каждой монете сигналы по строгой методике Элдора (основная),
+    цену, недельный тренд, Elder-ray, RSI и score, плюс быструю методику (MA5/13/20,
+    с 2026-09-25 тоже основная) и экспериментальный "ранний вход" (Bear Power у
+    нуля, добавлен 2026-09-25) — чтобы было видно расхождение между всеми тремя.
+    """
     if not results and not errors:
         return "Нет данных для отображения."
 
     buy_count = sum(1 for d in results if d["signal_type"] == "BUY")
     watch_count = sum(1 for d in results if d["signal_type"] == "WATCH")
     buy_count_fast = sum(1 for d in results if d["signal_type_fast"] == "BUY")
+    buy_count_early = sum(1 for d in results if d["signal_type_early"] == "BUY")
 
     header = title or f"Результаты сканирования ({len(results)} монет)"
 
     lines = [
         f"📊 {header}, от сильных к слабым: 🟢 BUY(Элдор) {buy_count} | 🟡 WATCH(Элдор) {watch_count} "
-        f"| 🔵 BUY(Быстрый, эксп.) {buy_count_fast}",
+        f"| 🔵 BUY(Быстрый) {buy_count_fast} | 🟣 BUY(Ранний, эксп.) {buy_count_early}",
         "",
     ]
 
@@ -143,10 +144,12 @@ def format_scan_result(results: list[dict], errors: list[tuple], title: str | No
         else:
             fast_bit = f" | Быстрый {emoji_fast}{d['signal_type_fast']}"
 
+        early_bit = " | 🟣Ранний BUY" if d["signal_type_early"] == "BUY" else ""
+
         lines.append(
             f"{i}. {emoji}{d['coin']} — {d['signal_type']} "
             f"| цена {d['price']} | недельный {d['ma_trend']['trend']} | RSI {d['daily_rsi']}"
-            f"{elder_bit}{fast_bit} | score {d['score']:.1f}"
+            f"{elder_bit}{fast_bit}{early_bit} | score {d['score']:.1f}"
         )
 
     if watch_count:
