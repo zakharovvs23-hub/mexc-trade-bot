@@ -1,5 +1,6 @@
 """
-Расчёт индикаторов: RSI, MACD, объём, Elder-ray (Bull Power / Bear Power),
+Расчёт индикаторов: RSI, MACD, объём, Elder-ray (Bull Power / Bear Power,
+плюс экспериментальный "ранний вход" по близости Bear Power к нулю),
 внутридневное движение.
 Используем pandas для скользящих средних.
 """
@@ -46,9 +47,24 @@ def calc_volume_signal(volumes: pd.Series, period: int = 20) -> str:
         return "ниже среднего"
     return "средний"
 
+EARLY_BEAR_POWER_PCT = 3.0  # см. calc_elder_ray: порог "ранний вход" методики (2026-09-25)
+
 def calc_elder_ray(df_d: pd.DataFrame, period: int = 13) -> dict:
     """
     Screen 2 (разворот Bear Power) + Screen 3 (добавлен 2026-09-08).
+
+    early_trigger (добавлено 2026-09-25, методика "ранний вход", ЭКСПЕРИМЕНТ) —
+    отдельное, более мягкое условие Screen 2: не ждём полноценного разворота
+    (bear_power_rising), а входим, как только Bear Power подошёл вплотную к нулю
+    (в пределах EARLY_BEAR_POWER_PCT % от цены закрытия), при Bull Power > 0.
+    Идея выросла из реального случая (JST, 24.09.2026): бот показывал WAIT
+    (bear_power_rising ещё не сработал), но Bear Power был уже практически на
+    нуле — сделка вручную зашла раньше формального сигнала и закрылась в плюс.
+    Проверено бэктестом на 10 альтах (HYPE/XMR/APT/SUI/FIL/VVV/JST/AERO/ZEC/TIA,
+    порог 3%): 24 сделки, 66.7% win-rate, +67% суммарно — сопоставимо с быстрой
+    методикой. Именно поэтому статус — экспериментальный, а не основной: одна
+    живая сделка не статистика, а бэктест сделан один раз и не на реальных
+    ордерах.
 
     Классический Triple Screen Элдора состоит из трёх экранов, а не двух:
     Screen 1 — недельный тренд, Screen 2 — дневной осциллятор, показывающий
@@ -73,6 +89,7 @@ def calc_elder_ray(df_d: pd.DataFrame, period: int = 13) -> dict:
             "bull_power": None, "bear_power": None, "bear_power_prev": None,
             "bear_power_rising": False, "screen2_trigger": False,
             "screen3_confirm": False, "prev_high": None,
+            "bear_power_pct": None, "early_trigger": False,
         }
     ema = df_d["close"].ewm(span=period, adjust=False).mean()
     bull_power = df_d["high"] - ema
@@ -87,6 +104,12 @@ def calc_elder_ray(df_d: pd.DataFrame, period: int = 13) -> dict:
     prev_high = float(df_d["high"].iloc[-2])
     screen3_confirm = today_close > prev_high
 
+    bear_power_pct = (brp_last / today_close * 100) if today_close else None
+    early_trigger = (
+        brp_last < 0 and bear_power_pct is not None
+        and bear_power_pct >= -EARLY_BEAR_POWER_PCT and bp_last > 0
+    )
+
     return {
         "bull_power": round(bp_last, 6),
         "bear_power": round(brp_last, 6),
@@ -95,6 +118,8 @@ def calc_elder_ray(df_d: pd.DataFrame, period: int = 13) -> dict:
         "screen2_trigger": screen2_trigger,
         "screen3_confirm": screen3_confirm,
         "prev_high": round(prev_high, 6),
+        "bear_power_pct": round(bear_power_pct, 2) if bear_power_pct is not None else None,
+        "early_trigger": early_trigger,
     }
 
 def calc_intraday_change(df_d: pd.DataFrame, price: float):
