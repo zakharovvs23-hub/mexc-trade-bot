@@ -463,9 +463,12 @@ async def _full_scan_job(context: ContextTypes.DEFAULT_TYPE):
         logger.warning("Широкий скан (авто-вотчлист): не удалось получить данные по %s",
                         ", ".join(c for c, _ in errors))
 
+    # 2026-09-25: быстрая методика теперь основная — берём и монеты, где подходящий тренд
+    # только по ней (раньше отбор шёл только по Элдору, и BUY по быстрой вне ручного
+    # вотчлиста не алертился). Ранний вход использует строгий тренд — он уже покрыт Элдором.
     candidates = sorted({
         d["coin"] for d in results
-        if d["signal_type"] != "WAIT"
+        if d["signal_type"] != "WAIT" or d["signal_type_fast"] != "WAIT"
     })
 
     prev_auto = set(_load_auto_watchlist())
