@@ -110,7 +110,9 @@ def _load_chat_id():
         with open(CHAT_ID_FILE) as f:
             return int(f.read().strip())
     except Exception:
-        return None
+        # Файл на Railway стирается при каждом передеплое — запасной вариант из переменной окружения.
+        env = (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
+        return int(env) if env.lstrip("-").isdigit() else None
 
 
 def _save_chat_id(chat_id: int):
@@ -407,10 +409,10 @@ async def _watch_job(context: ContextTypes.DEFAULT_TYPE):
         prev = _last_signal_state.get(coin)
         _last_signal_state[coin] = (cur_elder, cur_fast, cur_early)
 
-        if prev is None:
-            continue  # первая проверка после рестарта — просто фиксируем базу, без алерта
-
-        prev_elder, prev_fast, prev_early = prev
+        # После рестарта prev нет — считаем, что раньше был WAIT, и алертим уже действующие BUY
+        # (2026-09-25: раньше первая проверка после рестарта молча фиксировала базу, и сигналы,
+        # которые уже были BUY на момент передеплоя — XMR/TRX по раннему входу — так и не пришли).
+        prev_elder, prev_fast, prev_early = prev if prev is not None else ("WAIT", "WAIT", "WAIT")
         # Строим текст алерта из того же d, что дал BUY (не повторный запрос analyze(coin) —
         # см. format_analysis() в signals.py: между двумя живыми запросами цена успевала
         # откатиться, и текст алерта мог противоречить его же заголовку).
