@@ -19,6 +19,7 @@ MA60 растёт >1% за 6 недель) И дневном Screen 2 = Bear Pow
 """
 import pandas as pd
 from mexc_api import get_klines
+from indicators import EARLY_BEAR_POWER_PCT
 
 FLAT_MA_THRESHOLD_PCT = 1.0
 ELDER_PERIOD = 13
@@ -64,6 +65,18 @@ def _daily_screen2_series(df: pd.DataFrame, period: int = ELDER_PERIOD) -> pd.Se
     bear_rising = bear_power > bear_power.shift(1)
     return (bear_power < 0) & bear_rising & (bull_power > 0)
 
+def _daily_screen2_early_series(df: pd.DataFrame, period: int = ELDER_PERIOD,
+                                 threshold_pct: float = EARLY_BEAR_POWER_PCT) -> pd.Series:
+    """Screen 2, вариант "ранний вход" (ЭКСПЕРИМЕНТ, 2026-09-25) — та же логика, что
+    indicators.calc_elder_ray.early_trigger: не ждём bear_power_rising, входим, как
+    только Bear Power оказался в пределах threshold_pct% от цены закрытия (Bull
+    Power по-прежнему должен быть положительным). См. docstring calc_elder_ray."""
+    ema = df["close"].ewm(span=period, adjust=False).mean()
+    bull_power = df["high"] - ema
+    bear_power = df["low"] - ema
+    bear_power_pct = bear_power / df["close"] * 100
+    return (bear_power < 0) & (bear_power_pct >= -threshold_pct) & (bull_power > 0)
+
 def backtest(coin: str, days: int = 365, tp_pct: float = 0.06, sl_pct: float = 0.03,
              max_hold_days: int = 30, methodology: str = "strict") -> dict:
     """
@@ -71,17 +84,21 @@ def backtest(coin: str, days: int = 365, tp_pct: float = 0.06, sl_pct: float = 0
     данным и считает гипотетическую доходность.
 
     methodology: "strict" — строгая Elder (MA10/30/60, наклон за 6 недель, как в
-    calc_weekly_ma_trend); "fast" — экспериментальная быстрая (MA5/13/20, наклон
-    за 4 недели, минимум 24 недели истории, как в calc_weekly_ma_trend_fast).
-    Добавлено 2026-09-12 по просьбе Вадима — сравнить методики статистически,
-    вместо того чтобы торговать быстрыми сигналами живыми деньгами.
+    calc_weekly_ma_trend); "fast" — быстрая (MA5/13/20, наклон за 4 недели,
+    минимум 24 недели истории, как в calc_weekly_ma_trend_fast; с 2026-09-25
+    полноценная методика, не эксперимент); "early" — экспериментальный "ранний
+    вход" (тот же строгий недельный тренд, что у "strict", но Screen 2 мягче —
+    не ждём bear_power_rising, входим при Bear Power в пределах
+    indicators.EARLY_BEAR_POWER_PCT% от цены). Добавлено 2026-09-12/2026-09-25
+    по просьбе Вадима — сравнить методики статистически, вместо того чтобы
+    торговать непроверенными сигналами живыми деньгами.
     """
     if methodology == "fast":
         ma_periods, slope_lookback_weeks, min_weeks = (5, 13, 20), 4, 24
-    elif methodology == "strict":
+    elif methodology in ("strict", "early"):
         ma_periods, slope_lookback_weeks, min_weeks = (10, 30, 60), 6, 66
     else:
-        raise ValueError(f"Неизвестная методика: {methodology!r} (ожидается 'strict' или 'fast')")
+        raise ValueError(f"Неизвестная методика: {methodology!r} (ожидается 'strict', 'fast' или 'early')")
 
     klines = get_klines(coin, "1d", limit=min(days + 500, 1000))
     df = pd.DataFrame(klines)
@@ -92,7 +109,7 @@ def backtest(coin: str, days: int = 365, tp_pct: float = 0.06, sl_pct: float = 0
     tier_a = _weekly_tier_a_series(closes, ma_periods=ma_periods,
                                     slope_lookback_weeks=slope_lookback_weeks,
                                     min_weeks=min_weeks)
-    screen2 = _daily_screen2_series(df)
+    screen2 = _daily_screen2_early_series(df) if methodology == "early" else _daily_screen2_series(df)
     entry_signal = tier_a & screen2
 
     trades = []
@@ -155,7 +172,8 @@ def backtest(coin: str, days: int = 365, tp_pct: float = 0.06, sl_pct: float = 0
 
 _METHODOLOGY_LABEL = {
     "strict": "Elder's Triple Screen, строгая (MA10/30/60)",
-    "fast": "Быстрая эксперимент. (MA5/13/20)",
+    "fast": "Быстрая (MA5/13/20)",
+    "early": "Ранний вход, эксперим. (Bear Power у нуля)",
 }
 
 def format_backtest(result: dict) -> str:
