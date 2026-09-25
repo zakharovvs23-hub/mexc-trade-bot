@@ -1,6 +1,6 @@
 import pandas as pd
 
-from indicators import calc_rsi, calc_macd, calc_volume_signal, calc_elder_ray, calc_intraday_change
+from indicators import calc_rsi, calc_macd, calc_volume_signal, calc_elder_ray, calc_intraday_change, EARLY_BEAR_POWER_PCT
 from mexc_api import get_klines, get_current_price
 from fear_greed import get_fear_greed, fear_greed_note
 
@@ -45,16 +45,17 @@ def calc_weekly_ma_trend(weekly_close: pd.Series, price: float) -> dict:
     }
 def calc_weekly_ma_trend_fast(weekly_close: pd.Series, price: float) -> dict:
     """
-    Быстрый вариант Screen 1 (эксперимент, добавлен 2026-09-08) — та же логика,
-    что calc_weekly_ma_trend, но с более короткими MA (5/13/20 недель вместо
-    10/30/60) и укороченным окном наклона (4 недели вместо 6).
+    Быстрый вариант Screen 1 (добавлен 2026-09-08 как эксперимент, с 2026-09-25 —
+    полноценная рабочая методика) — та же логика, что calc_weekly_ma_trend, но
+    с более короткими MA (5/13/20 недель вместо 10/30/60) и укороченным окном
+    наклона (4 недели вместо 6).
 
     Причина: 60-недельная MA (больше года) слишком медленная для крипты —
     на бэктесте реальных монет (BTC/XMR/ZEC) она почти никогда не успевала
     признать тренд бычьим, сигналов было мало. Быстрая версия считается
-    ПАРАЛЛЕЛЬНО со строгой, не заменяет её — чтобы сравнить, сколько
-    дополнительных сигналов она даёт и насколько они прибыльны, прежде
-    чем делать её основной.
+    ПАРАЛЛЕЛЬНО со строгой (не заменяет её) — по бэктесту на 10 альтах
+    сопоставима со строгой по качеству (65-66% win-rate против 80%, но
+    заметно больше сделок), поэтому с 2026-09-25 статус повышен до основной.
     """
     if len(weekly_close) < 24:
         return {"trend": "Недостаточно данных", "ma5": None, "ma13": None, "ma20": None, "ma20_slope_pct": None}
@@ -131,12 +132,21 @@ def analyze_raw(coin: str) -> dict:
     массового сканирования пулом (scanner.py).
 
     Основная методика (signal_type) — Элдора (откат Bear Power внутри уже бычьей
-    структуры). Параллельно считается экспериментальная быстрая версия того же
-    Screen 1 (signal_type_fast, MA5/13/20 вместо MA10/30/60).
+    структуры). Параллельно считается быстрая версия того же Screen 1
+    (signal_type_fast, MA5/13/20 вместо MA10/30/60) — с 2026-09-25 полноценная
+    рабочая методика, а не эксперимент (по бэктесту сопоставима со строгой).
 
     2026-09-24: методика Гудмана (пробой 20-дневного максимума закрытия) убрана
     из бота — по реальной статистике сделок из торгового журнала она дала 0%
     win-rate. См. ways-of-working.md за подробностями бэктеста.
+
+    2026-09-25: добавлена третья, экспериментальная методика — "ранний вход"
+    (signal_type_early) — вход по строгому Screen 1 (тот же тренд, что у
+    основной методики), но без ожидания полноценного разворота Bear Power:
+    достаточно, чтобы Bear Power подошёл вплотную к нулю (indicators.EARLY_
+    BEAR_POWER_PCT). См. docstring calc_elder_ray в indicators.py и запись в
+    ways-of-working.md за 2026-09-25 — статус экспериментальный, статистика
+    собирается.
     """
     price = get_current_price(coin)
     weekly = get_klines(coin, "1w", limit=110)
@@ -242,6 +252,30 @@ def analyze_raw(coin: str) -> dict:
         signal_type_fast = "WAIT"
         reasoning_fast.append("Недельный тренд (быстрый) — боковик/переходный")
 
+    # "Ранний вход" (ЭКСПЕРИМЕНТ, 2026-09-25) — тот же строгий Screen 1 (tier_a),
+    # что у основной методики, но Screen 2 мягче: не ждём bear_power_rising,
+    # достаточно, что Bear Power уже в пределах EARLY_BEAR_POWER_PCT% от цены.
+    # Бинарный сигнал (BUY/WAIT, без WATCH) — так и было в бэктесте, который
+    # это правило проверял. См. docstring calc_elder_ray.
+    reasoning_early = []
+    if tier_a and elder["early_trigger"]:
+        signal_type_early = "BUY"
+        reasoning_early.append(
+            "Screen 1: недельный тренд Бычий (строгая методика). "
+            f"Screen 2 (мягкий): Bear Power {elder['bear_power']} — уже в пределах "
+            f"{EARLY_BEAR_POWER_PCT}% от цены ({elder['bear_power_pct']}%), Bull Power {elder['bull_power']} > 0 — "
+            "вход до полноценного разворота индикатора."
+        )
+    elif tier_a:
+        signal_type_early = "WAIT"
+        reasoning_early.append(
+            f"Screen 1: недельный тренд Бычий. Bear Power {elder['bear_power']} "
+            f"({elder['bear_power_pct']}% от цены) ещё не в пределах {EARLY_BEAR_POWER_PCT}% от нуля."
+        )
+    else:
+        signal_type_early = "WAIT"
+        reasoning_early.append("Недельный тренд (строгий) не бычий — сигнала нет")
+
     if signal_type in ("BUY", "WATCH") and daily_rsi > 70:
         reasoning.append(f"⚠️ RSI {daily_rsi} — перекуплен, возможна дивергенция, проверь дневной график глазами")
 
@@ -286,9 +320,11 @@ def analyze_raw(coin: str) -> dict:
         "tier_a": tier_a,
         "signal_type": signal_type,
         "signal_type_fast": signal_type_fast,
+        "signal_type_early": signal_type_early,
         "needs_review": needs_review,
         "reasoning": reasoning,
         "reasoning_fast": reasoning_fast,
+        "reasoning_early": reasoning_early,
         "score": round(score, 2),
     }
 def analyze(coin: str) -> str:
@@ -370,12 +406,19 @@ def format_analysis(d: dict) -> str:
 
     lines.append("")
     if d["signal_type_fast"] == "BUY":
-        lines.append("💡 СИГНАЛ (быстрый Screen 1, MA5/13/20, ЭКСПЕРИМЕНТ): Buy — статистики по этой методике "
-                      "пока меньше, чем по двум другим (см. /backtest МОНЕТА fast), решение по объёму делай сам")
+        lines.append("💡 СИГНАЛ (быстрый Screen 1, MA5/13/20): Buy")
     elif d["signal_type_fast"] == "WATCH":
-        lines.append("💡 СИГНАЛ (быстрый Screen 1, MA5/13/20, ЭКСПЕРИМЕНТ): Следить")
+        lines.append("💡 СИГНАЛ (быстрый Screen 1, MA5/13/20): Следить")
     else:
-        lines.append("💡 СИГНАЛ (быстрый Screen 1, MA5/13/20, ЭКСПЕРИМЕНТ): Ждать")
+        lines.append("💡 СИГНАЛ (быстрый Screen 1, MA5/13/20): Ждать")
     lines.append("Обоснование: " + "; ".join(d["reasoning_fast"]))
+
+    lines.append("")
+    if d["signal_type_early"] == "BUY":
+        lines.append("💡 СИГНАЛ (ранний вход, Bear Power у нуля, ЭКСПЕРИМЕНТ): Buy — статистики по этой методике "
+                      "пока меньше, чем по двум другим (см. /backtest МОНЕТА early), решение по объёму делай сам")
+    else:
+        lines.append("💡 СИГНАЛ (ранний вход, Bear Power у нуля, ЭКСПЕРИМЕНТ): Ждать")
+    lines.append("Обоснование: " + "; ".join(d["reasoning_early"]))
 
     return "\n".join(lines)
